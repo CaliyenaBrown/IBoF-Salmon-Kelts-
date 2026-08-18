@@ -1,0 +1,761 @@
+---
+title: "Spatial predation patterns"
+author: "Caliyena Brown"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(sf)
+library(ggplot2)
+library(ggspatial)
+library(rnaturalearth)
+library(scales)
+library(svglite)
+```
+
+# Purpose
+
+This document assigns approximate locations to the finalized inferred
+predation events, constructs overall and month-specific 100% minimum convex
+polygons (MCPs), calculates MCP areas, and quantifies the spatial and temporal
+separation between the last confirmed alive and first post-predation
+detections. It exports clean base maps as PNG and SVG files for final assembly
+in Inkscape.
+
+# Analysis settings
+
+```{r settings}
+# Coordinate reference systems
+geographic_crs <- 4326
+utm_crs <- 32620
+
+# Map extent used for the Bay of Fundy analysis and figures
+map_xlim <- c(-68.9, -64.5)
+map_ylim <- c(43.9, 45.5)
+
+# Months must contain more than this number of events to receive an MCP
+minimum_monthly_events <- 2
+
+month_levels <- month.name
+
+month_colours <- c(
+  "January" = "#D9D9D9",
+  "February" = "#D9D9D9",
+  "March" = "#D9D9D9",
+  "April" = "#E4A3A9",
+  "May" = "#D3D3D3",
+  "June" = "#D8576E",
+  "July" = "#FFC000",
+  "August" = "#4EA72E",
+  "September" = "#13501B",
+  "October" = "#D9D9D9",
+  "November" = "#D9D9D9",
+  "December" = "#D9D9D9"
+)
+
+```
+
+# Import and prepare data
+
+This file expects the cleaned detections and finalized predation events used in
+the mortality and temporal analyses. It also expects an analysis-ready receiver
+file containing one row per station in the Bay of Fundy array.
+
+```{r import-data}
+det <- readRDS("det_clean_no_release_site_det.rds")
+predation_events <- readRDS("predation_events_clean.rds")
+receivers <- read_csv(
+  "receiver_metadata_clean.csv",
+  show_col_types = FALSE
+)
+
+required_det_columns <- c(
+  "fish", "dt", "lon", "lat", "station", "receiver"
+)
+
+required_predation_columns <- c(
+  "fish", "predation_dt", "predation_temp"
+)
+
+required_receiver_columns <- c(
+  "station", "lon", "lat", "marine_farm"
+)
+
+stopifnot(
+  all(required_det_columns %in% names(det)),
+  all(required_predation_columns %in% names(predation_events)),
+  all(required_receiver_columns %in% names(receivers))
+)
+
+# Confirm that the cleaned receiver file contains valid, unique stations.
+receivers <- receivers %>%
+  mutate(
+    station = as.character(station),
+    lon = as.numeric(lon),
+    lat = as.numeric(lat),
+    marine_farm = as.logical(marine_farm)
+  ) %>%
+  filter(
+    !is.na(station),
+    !is.na(lon),
+    !is.na(lat)
+  ) %>%
+  distinct(station, .keep_all = TRUE)
+
+if (anyNA(receivers$marine_farm)) {
+  stop("The marine_farm column must contain only TRUE or FALSE values.")
+}
+
+marine_farm_receivers <- receivers %>%
+  filter(marine_farm)
+
+# Convert detection and event times to UTC without discarding time of day.
+if (inherits(det$dt, "POSIXct")) {
+  det$dt <- with_tz(det$dt, tzone = "UTC")
+} else {
+  det$dt <- ymd_hms(det$dt, tz = "UTC", quiet = TRUE)
+}
+
+if (inherits(predation_events$predation_dt, "POSIXct")) {
+  predation_events$predation_dt <- with_tz(
+    predation_events$predation_dt,
+    tzone = "UTC"
+  )
+} else {
+  predation_events$predation_dt <- ymd_hms(
+    predation_events$predation_dt,
+    tz = "UTC",
+    quiet = TRUE
+  )
+}
+
+det <- det %>%
+  mutate(
+    fish = as.integer(fish),
+    lon = as.numeric(lon),
+    lat = as.numeric(lat)
+  ) %>%
+  filter(
+    !is.na(fish),
+    !is.na(dt)
+  ) %>%
+  arrange(fish, dt)
+
+predation_events <- predation_events %>%
+  mutate(
+    fish = as.integer(fish),
+    month = factor(
+      month.name[month(predation_dt)],
+      levels = month_levels,
+      ordered = TRUE
+    )
+  ) %>%
+  distinct(fish, .keep_all = TRUE)
+
+stopifnot(
+  nrow(predation_events) == 13,
+  anyDuplicated(predation_events$fish) == 0
+)
+```
+
+# Assign approximate predation locations
+
+The approximate predation location is the receiver associated with the saved
+first post-predation detection. Matching uses fish identity and the complete
+timestamp so that the spatial and temporal analyses use the same events.
+
+```{r assign-event-locations}
+predation_locations <- predation_events %>%
+  select(
+    fish,
+    predation_dt,
+    predation_temp,
+    month
+  ) %>%
+  left_join(
+    det %>%
+      filter(
+        !is.na(lon),
+        !is.na(lat)
+      ) %>%
+      select(
+        fish,
+        detection_dt = dt,
+        station,
+        receiver,
+        lon,
+        lat
+      ) %>%
+      distinct(
+        fish,
+        detection_dt,
+        .keep_all = TRUE
+      ),
+    by = c(
+      "fish",
+      "predation_dt" = "detection_dt"
+    )
+  ) %>%
+  filter(
+    !is.na(lon),
+    !is.na(lat),
+    station %in% receivers$station,
+    between(lon, map_xlim[1], map_xlim[2]),
+    between(lat, map_ylim[1], map_ylim[2])
+  ) %>%
+  arrange(predation_dt)
+
+if (nrow(predation_locations) != nrow(predation_events)) {
+  missing_fish <- setdiff(
+    predation_events$fish,
+    predation_locations$fish
+  )
+
+  stop(
+    "Predation locations could not be assigned for fish: ",
+    paste(missing_fish, collapse = ", ")
+  )
+}
+
+predation_locations_sf <- st_as_sf(
+  predation_locations,
+  coords = c("lon", "lat"),
+  crs = geographic_crs,
+  remove = FALSE
+)
+
+predation_locations_utm <- st_transform(
+  predation_locations_sf,
+  utm_crs
+)
+
+predation_locations
+```
+
+# Construct overall and monthly MCPs
+
+```{r construct-mcps}
+# Confirm that at least three unique locations are available for the overall MCP.
+if (nrow(distinct(predation_locations, lon, lat)) < 3) {
+  stop("At least three unique predation locations are required for an MCP.")
+}
+
+# Construct the 100% MCP from all assigned predation locations.
+mcp_all_utm <- predation_locations_utm %>%
+  summarise(geometry = st_convex_hull(st_union(geometry)))
+
+mcp_all_ll <- st_transform(mcp_all_utm, geographic_crs)
+
+mcp_all_area <- mcp_all_utm %>%
+  mutate(
+    group = "All events",
+    n_events = nrow(predation_locations),
+    area_km2 = as.numeric(st_area(geometry)) / 1e6
+  ) %>%
+  st_drop_geometry() %>%
+  select(group, n_events, area_km2)
+
+# Identify months containing more than two predation events and at least three
+# unique coordinates.
+months_for_mcp <- predation_locations %>%
+  group_by(month) %>%
+  summarise(
+    n_events = n(),
+    n_locations = n_distinct(paste(lon, lat)),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_events > minimum_monthly_events,
+    n_locations >= 3
+  )
+
+# Construct one 100% MCP for every qualifying month.
+mcp_month_utm <- predation_locations_utm %>%
+  filter(month %in% months_for_mcp$month) %>%
+  group_by(month) %>%
+  summarise(
+    n_events = n(),
+    geometry = st_convex_hull(st_union(geometry)),
+    .groups = "drop"
+  )
+
+mcp_month_ll <- st_transform(mcp_month_utm, geographic_crs)
+
+mcp_month_areas <- mcp_month_utm %>%
+  mutate(
+    area_km2 = as.numeric(st_area(geometry)) / 1e6
+  ) %>%
+  st_drop_geometry() %>%
+  arrange(month)
+
+mcp_area_summary <- bind_rows(
+  mcp_all_area,
+  mcp_month_areas %>%
+    transmute(
+      group = as.character(month),
+      n_events,
+      area_km2
+    )
+)
+
+knitr::kable(
+  mcp_area_summary,
+  digits = 1,
+  caption = "Areas encompassed by overall and month-specific 100% MCPs."
+)
+
+write_csv(
+  mcp_area_summary,
+  "predation_mcp_area_summary.csv",
+  na = "NA"
+)
+
+# Export spatial objects for inspection or reuse.
+st_write(
+  mcp_all_ll,
+  "predation_mcp_overall.gpkg",
+  layer = "overall_mcp",
+  delete_dsn = TRUE,
+  quiet = TRUE
+)
+
+st_write(
+  mcp_month_ll,
+  "predation_mcp_monthly.gpkg",
+  layer = "monthly_mcps",
+  delete_dsn = TRUE,
+  quiet = TRUE
+)
+```
+
+# Quantify spatial and temporal uncertainty
+
+```{r spatial-uncertainty-data}
+# Identify the immediately preceding detection with valid coordinates.
+last_alive_locations <- det %>%
+  inner_join(
+    predation_locations %>%
+      select(fish, predation_dt),
+    by = "fish"
+  ) %>%
+  filter(
+    dt < predation_dt,
+    !is.na(lon),
+    !is.na(lat)
+  ) %>%
+  group_by(fish) %>%
+  slice_max(
+    order_by = dt,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  transmute(
+    fish,
+    last_alive_dt = dt,
+    last_alive_station = station,
+    last_alive_lon = lon,
+    last_alive_lat = lat
+  )
+
+uncertainty_pairs <- predation_locations %>%
+  transmute(
+    fish,
+    predation_dt,
+    predation_station = station,
+    predation_lon = lon,
+    predation_lat = lat,
+    predation_temp,
+    month
+  ) %>%
+  left_join(last_alive_locations, by = "fish") %>%
+  mutate(
+    interval_hours = as.numeric(
+      difftime(
+        predation_dt,
+        last_alive_dt,
+        units = "hours"
+      )
+    ),
+    interval_days = interval_hours / 24
+  )
+
+if (anyNA(uncertainty_pairs$last_alive_lon) ||
+    anyNA(uncertainty_pairs$last_alive_lat)) {
+  stop("At least one fish is missing a preceding detection location.")
+}
+
+# Convert paired coordinates to projected points.
+last_alive_sf <- st_as_sf(
+  uncertainty_pairs,
+  coords = c("last_alive_lon", "last_alive_lat"),
+  crs = geographic_crs,
+  remove = FALSE
+) %>%
+  st_transform(utm_crs)
+
+post_predation_sf <- st_as_sf(
+  uncertainty_pairs,
+  coords = c("predation_lon", "predation_lat"),
+  crs = geographic_crs,
+  remove = FALSE
+) %>%
+  st_transform(utm_crs)
+
+# Calculate straight-line distance between paired receiver locations.
+spatial_distance_km <- as.numeric(
+  st_distance(
+    st_geometry(last_alive_sf),
+    st_geometry(post_predation_sf),
+    by_element = TRUE
+  )
+) / 1000
+
+uncertainty_summary <- uncertainty_pairs %>%
+  mutate(
+    spatial_distance_km = spatial_distance_km
+  ) %>%
+  select(
+    fish,
+    month,
+    last_alive_dt,
+    predation_dt,
+    interval_hours,
+    interval_days,
+    last_alive_station,
+    predation_station,
+    last_alive_lon,
+    last_alive_lat,
+    predation_lon,
+    predation_lat,
+    spatial_distance_km,
+    predation_temp
+  ) %>%
+  arrange(desc(spatial_distance_km))
+
+knitr::kable(
+  uncertainty_summary,
+  digits = 2,
+  caption = paste(
+    "Temporal and spatial separation between the last confirmed alive",
+    "and first post-predation detections."
+  )
+)
+
+write_csv(
+  uncertainty_summary,
+  "predation_spatial_uncertainty.csv",
+  na = "NA"
+)
+```
+
+# Prepare map layers
+
+```{r map-layers}
+# Combine Canada and the United States for the coastline basemap.
+land <- rnaturalearth::ne_countries(
+  scale = "medium",
+  returnclass = "sf"
+) %>%
+  filter(admin %in% c("Canada", "United States of America")) %>%
+  st_transform(geographic_crs)
+
+receivers_sf <- st_as_sf(
+  receivers,
+  coords = c("lon", "lat"),
+  crs = geographic_crs,
+  remove = FALSE
+)
+
+marine_farm_sf <- st_as_sf(
+  marine_farm_receivers,
+  coords = c("lon", "lat"),
+  crs = geographic_crs,
+  remove = FALSE
+)
+
+# Build one line segment from the last alive to post-predation location for
+# each fish. Lines are constructed in UTM and transformed back for plotting.
+segment_list <- lapply(seq_len(nrow(uncertainty_pairs)), function(i) {
+  coordinates <- matrix(
+    c(
+      uncertainty_pairs$last_alive_lon[i],
+      uncertainty_pairs$last_alive_lat[i],
+      uncertainty_pairs$predation_lon[i],
+      uncertainty_pairs$predation_lat[i]
+    ),
+    ncol = 2,
+    byrow = TRUE
+  )
+
+  st_linestring(coordinates)
+})
+
+uncertainty_segments <- st_sf(
+  fish = uncertainty_pairs$fish,
+  geometry = st_sfc(segment_list, crs = geographic_crs)
+)
+
+last_alive_plot_sf <- st_as_sf(
+  uncertainty_pairs,
+  coords = c("last_alive_lon", "last_alive_lat"),
+  crs = geographic_crs,
+  remove = FALSE
+)
+
+post_predation_plot_sf <- st_as_sf(
+  uncertainty_pairs,
+  coords = c("predation_lon", "predation_lat"),
+  crs = geographic_crs,
+  remove = FALSE
+)
+
+fish_levels <- sort(unique(uncertainty_pairs$fish))
+
+shape_values <- c(
+  0, 3, 18, 17, 8, 5, 6,
+  1, 15, 16, 2, 4, 7
+)
+
+if (length(fish_levels) > length(shape_values)) {
+  stop("Add more point shapes for the number of fish being plotted.")
+}
+
+fish_shapes <- setNames(
+  shape_values[seq_along(fish_levels)],
+  as.character(fish_levels)
+)
+
+last_alive_plot_sf <- last_alive_plot_sf %>%
+  mutate(
+    fish_id = factor(fish, levels = fish_levels)
+  )
+
+post_predation_plot_sf <- post_predation_plot_sf %>%
+  mutate(
+    fish_id = factor(fish, levels = fish_levels)
+  )
+```
+
+# Panel A: predation extent and monthly MCPs
+
+```{r panel-a, fig.width=10, fig.height=6.5, fig.cap="Approximate locations and 100% MCPs of inferred predation events in the Bay of Fundy. The light-blue polygon represents the overall MCP; coloured polygons represent months containing more than two events."}
+panel_a <- ggplot() +
+  # Overall and monthly MCPs are drawn before land so land masks polygon areas
+  # that cross coastlines without changing the calculated MCP areas.
+  geom_sf(
+    data = mcp_all_ll,
+    fill = "lightblue",
+    colour = "midnightblue",
+    alpha = 0.35,
+    linewidth = 0.5
+  ) +
+  geom_sf(
+    data = mcp_month_ll,
+    aes(fill = month, colour = month),
+    alpha = 0.30,
+    linewidth = 0.7
+  ) +
+  geom_sf(
+    data = land,
+    fill = "grey97",
+    colour = "grey70",
+    linewidth = 0.3
+  ) +
+  geom_sf(
+    data = receivers_sf,
+    shape = 16,
+    colour = "grey45",
+    size = 1,
+    alpha = 0.65
+  ) +
+  geom_sf(
+    data = predation_locations_sf,
+    aes(colour = month),
+    size = 3.2,
+    alpha = 0.95
+  ) +
+  scale_colour_manual(
+    values = month_colours,
+    drop = TRUE,
+    name = "Month"
+  ) +
+  scale_fill_manual(
+    values = month_colours,
+    drop = TRUE,
+    name = "Month"
+  ) +
+  coord_sf(
+    xlim = map_xlim,
+    ylim = map_ylim,
+    expand = FALSE
+  ) +
+  annotation_scale(
+    location = "br",
+    width_hint = 0.18
+  ) +
+  annotation_north_arrow(
+    location = "br",
+    which_north = "true",
+    pad_x = grid::unit(0.4, "cm"),
+    pad_y = grid::unit(0.9, "cm"),
+    style = north_arrow_fancy_orienteering,
+    height = grid::unit(0.9, "cm"),
+    width = grid::unit(0.8, "cm")
+  ) +
+  labs(
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 11)
+  )
+
+panel_a
+
+ggsave(
+  "spatial_predation_panel_A.png",
+  panel_a,
+  width = 10,
+  height = 6.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  "spatial_predation_panel_A.svg",
+  panel_a,
+  width = 10,
+  height = 6.5,
+  units = "in",
+  bg = "white"
+)
+```
+
+# Panel B: spatial uncertainty
+
+```{r panel-b, fig.width=10, fig.height=6.5, fig.cap="Spatial uncertainty between the last confirmed alive and first post-predation detections. Red and blue symbols show paired detections for each fish; black lines connect the locations. Gold diamonds indicate marine-farm receiver stations."}
+panel_b <- ggplot() +
+  geom_sf(
+    data = mcp_all_ll,
+    fill = "lightblue",
+    colour = "lightblue",
+    alpha = 0.35,
+    linewidth = 0.4
+  ) +
+  geom_sf(
+    data = land,
+    fill = "grey97",
+    colour = "grey70",
+    linewidth = 0.3
+  ) +
+  geom_sf(
+    data = marine_farm_sf,
+    shape = 23,
+    colour = "black",
+    fill = "gold",
+    stroke = 0.4,
+    size = 2.8,
+    alpha = 0.8
+  ) +
+  geom_sf(
+    data = uncertainty_segments,
+    colour = "black",
+    linewidth = 0.5,
+    alpha = 0.8
+  ) +
+  geom_sf(
+    data = last_alive_plot_sf,
+    aes(shape = fish_id),
+    colour = "red3",
+    size = 3.5,
+    stroke = 0.9
+  ) +
+  geom_sf(
+    data = post_predation_plot_sf,
+    aes(shape = fish_id),
+    colour = "midnightblue",
+    size = 3.5,
+    stroke = 0.9
+  ) +
+  scale_shape_manual(
+    values = fish_shapes,
+    name = "Fish ID"
+  ) +
+  coord_sf(
+    xlim = map_xlim,
+    ylim = map_ylim,
+    expand = FALSE
+  ) +
+  annotation_scale(
+    location = "br",
+    width_hint = 0.18
+  ) +
+  annotation_north_arrow(
+    location = "br",
+    which_north = "true",
+    pad_x = grid::unit(0.4, "cm"),
+    pad_y = grid::unit(0.9, "cm"),
+    style = north_arrow_fancy_orienteering,
+    height = grid::unit(0.9, "cm"),
+    width = grid::unit(0.8, "cm")
+  ) +
+  labs(
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 10)
+  )
+
+panel_b
+
+ggsave(
+  "spatial_predation_panel_B.png",
+  panel_b,
+  width = 10,
+  height = 6.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  "spatial_predation_panel_B.svg",
+  panel_b,
+  width = 10,
+  height = 6.5,
+  units = "in",
+  bg = "white"
+)
+```
+
+# Reproducibility
+
+```{r session-info}
+sessionInfo()
+```

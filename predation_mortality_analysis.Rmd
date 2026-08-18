@@ -1,0 +1,706 @@
+---
+title: "Predation mortality analysis"
+author: "Caliyena Brown"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  temperature_threshold: 20
+  excluded_predation_fish: 72
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(survival)
+library(coxphf)
+```
+
+# Purpose
+
+This document identifies temperature-defined predation events, calculates fate
+and predation proportions, compares total length and sex composition between
+release cohorts, and evaluates the effects of total length and sex on time to
+inferred predation using a Firth-penalized Cox proportional hazards model.
+
+# Import and validate data
+
+```{r import-data}
+det <- readRDS("det_clean_no_release_site_det.rds")
+meta_tag <- readRDS("meta_clean.rds")
+
+# Convert tag-level metadata to one record per fish
+meta <- meta_tag %>%
+  select(fish, sex, tl, fl, release_dt) %>%
+  distinct() %>%
+  mutate(
+    cohort = case_when(
+      lubridate::month(release_dt) == 4 ~ "April",
+      lubridate::month(release_dt) == 12 ~ "December"
+    ),
+    cohort = factor(cohort, levels = c("April", "December")),
+    sex = factor(
+      sex,
+      levels = c("F", "M"),
+      labels = c("Female", "Male")
+    )
+  )
+
+stopifnot(
+  nrow(meta) == 101,
+  anyDuplicated(meta$fish) == 0
+)
+
+det <- det %>%
+  transmute(
+    fish = as.integer(fish),
+    temp = as.numeric(temp),
+    dt = ymd_hms(dt, tz = "UTC", quiet = TRUE)
+  ) %>%
+  filter(!is.na(fish), !is.na(dt), fish %in% meta$fish) %>%
+  arrange(fish, dt)
+```
+
+# Detection and fate summaries
+
+```{r identify-events}
+detected_fish <- intersect(meta$fish, unique(det$fish))
+undetected_fish <- setdiff(meta$fish, detected_fish)
+
+# The first record above 20 degrees C is treated as the inferred predation
+# event. Fish 72 is excluded because review of detections during the same period
+# showed that its high-temperature record was not a rapid, prolonged increase.
+predation_events <- det %>%
+  filter(
+    !is.na(temp),
+    temp > params$temperature_threshold,
+    !fish %in% params$excluded_predation_fish
+  ) %>%
+  group_by(fish) %>%
+  slice_min(dt, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  rename(predation_dt = dt, predation_temp = temp)
+
+last_detections <- det %>%
+  group_by(fish) %>%
+  summarise(last_detection_dt = max(dt), .groups = "drop")
+
+fish_fates <- meta %>%
+  left_join(last_detections, by = "fish") %>%
+  left_join(
+    predation_events %>% select(fish, predation_dt, predation_temp),
+    by = "fish"
+  ) %>%
+  mutate(
+    detected = fish %in% detected_fish,
+    predation = !is.na(predation_dt),
+    fate = case_when(
+      predation ~ "Inferred predation",
+      !detected ~ "Mortality assumed: no post-release detection",
+      TRUE ~ "Unknown"
+    )
+  )
+
+fate_summary <- fish_fates %>%
+  count(cohort, fate, name = "n") %>%
+  group_by(cohort) %>%
+  mutate(proportion_released = n / sum(n)) %>%
+  ungroup()
+
+predation_summary <- fish_fates %>%
+  group_by(cohort) %>%
+  summarise(
+    n_released = n(),
+    n_detected = sum(detected),
+    n_predated = sum(predation),
+    proportion_of_released = n_predated / n_released,
+    proportion_of_detected = n_predated / n_detected,
+    .groups = "drop"
+  ) %>%
+  bind_rows(
+    fish_fates %>%
+      summarise(
+        cohort = factor("All", levels = c("April", "December", "All")),
+        n_released = n(),
+        n_detected = sum(detected),
+        n_predated = sum(predation),
+        proportion_of_released = n_predated / n_released,
+        proportion_of_detected = n_predated / n_detected
+      )
+  )
+
+knitr::kable(fate_summary, digits = 3,
+             caption = "Fate classifications by release cohort.")
+knitr::kable(predation_summary, digits = 3,
+             caption = "Inferred predation as a proportion of released and detected kelts.")
+```
+
+# Detection histories and temperature profiles
+
+Detection histories were visualized separately for the April and December
+release cohorts using abacus plots. Points represent individual detections and
+are coloured according to recorded transmitter temperature. For kelts with an
+inferred predation event, detections after the first temperature increase above
+20°C were excluded. The first detection above 20°C was retained and marked as
+the inferred predation event.
+
+
+```{r abacus-plot, fig.width=14, fig.height=8, fig.cap="Detection histories and recorded transmitter temperatures of Atlantic salmon kelts released in April (A) and December (B). Each row represents one detected kelt, and points represent individual detections coloured by temperature. Crosses and adjacent values identify the first temperature record above 20°C interpreted as an inferred predation event. Detections following inferred predation were excluded."}
+
+# Add cohort information to detections
+det_plot <- det %>%
+  left_join(
+    meta %>% select(fish, cohort),
+    by = "fish"
+  ) %>%
+  left_join(
+    predation_events %>% select(fish, predation_dt),
+    by = "fish"
+  ) %>%
+  filter(is.na(predation_dt) | dt <= predation_dt) %>%
+  mutate(
+    detection_date = as.Date(dt),
+    fish = factor(fish)
+  ) %>%
+  # Cooler detections are drawn first and warmer detections are drawn on top
+  arrange(is.na(temp), temp)
+
+# Prepare predation-event labels
+predation_labels <- predation_events %>%
+  left_join(
+    meta %>% select(fish, cohort),
+    by = "fish"
+  ) %>%
+  mutate(
+    detection_date = as.Date(predation_dt),
+    fish = factor(fish),
+    temperature_label = paste0(round(predation_temp, 1), "°C")
+  )
+
+# Data for each cohort
+april_plot_data <- det_plot %>%
+  filter(cohort == "April") %>%
+  mutate(
+    fish = factor(
+      fish,
+      levels = rev(sort(unique(as.numeric(as.character(fish)))))
+    )
+  )
+
+december_plot_data <- det_plot %>%
+  filter(cohort == "December") %>%
+  mutate(
+    fish = factor(
+      fish,
+      levels = rev(sort(unique(as.numeric(as.character(fish)))))
+    )
+  )
+
+april_predation <- predation_labels %>%
+  filter(cohort == "April") %>%
+  mutate(
+    fish = factor(
+      fish,
+      levels = levels(april_plot_data$fish)
+    )
+  )
+
+december_predation <- predation_labels %>%
+  filter(cohort == "December") %>%
+  mutate(
+    fish = factor(
+      fish,
+      levels = levels(december_plot_data$fish)
+    )
+  )
+
+# Shared plot formatting
+common_theme <- theme_minimal(base_size = 16) +
+  theme(
+    axis.title.x = element_text(size = 18, margin = margin(t = 12)),
+    axis.title.y = element_text(size = 18, margin = margin(r = 12)),
+    axis.text.x = element_text(
+      size = 14,
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(size = 14),
+    panel.grid.major.y = element_line(colour = "grey80"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.tag = element_text(face = "bold", size = 18),
+    plot.title = element_text(face = "bold", size = 18),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+  )
+
+temperature_scale <- scale_colour_viridis_c(
+  option = "plasma",
+  limits = c(0, 40),
+  oob = scales::squish,
+  name = "Temperature (°C)"
+)
+
+# April release cohort
+p_april <- ggplot(
+  april_plot_data,
+  aes(x = detection_date, y = fish, colour = temp)
+) +
+  geom_point(size = 3, alpha = 0.8, na.rm = TRUE) +
+  geom_point(
+    data = april_predation,
+    aes(x = detection_date, y = fish),
+    inherit.aes = FALSE,
+    shape = 4,
+    size = 4,
+    stroke = 1.2,
+    colour = "black"
+  ) +
+  geom_text(
+    data = april_predation,
+    aes(
+      x = detection_date,
+      y = fish,
+      label = temperature_label
+    ),
+    inherit.aes = FALSE,
+    nudge_x = 4,
+    hjust = 0,
+    size = 5,
+    colour = "black"
+  ) +
+  temperature_scale +
+  scale_x_date(
+    limits = as.Date(c("2024-04-11", "2024-08-19")),
+    date_breaks = "2 weeks",
+    date_labels = "%b %d",
+    expand = expansion(mult = c(0.01, 0.08))
+  ) +
+  labs(
+    x = "Date",
+    y = "Fish",
+    title = "April release",
+    tag = "A"
+  ) +
+  common_theme
+
+# December release cohort
+p_december <- ggplot(
+  december_plot_data,
+  aes(x = detection_date, y = fish, colour = temp)
+) +
+  geom_point(size = 3, alpha = 0.8, na.rm = TRUE) +
+  geom_point(
+    data = december_predation,
+    aes(x = detection_date, y = fish),
+    inherit.aes = FALSE,
+    shape = 4,
+    size = 4,
+    stroke = 1.2,
+    colour = "black"
+  ) +
+  geom_text(
+    data = december_predation,
+    aes(
+      x = detection_date,
+      y = fish,
+      label = temperature_label
+    ),
+    inherit.aes = FALSE,
+    nudge_x = 8,
+    hjust = 0,
+    size = 5,
+    colour = "black"
+  ) +
+  temperature_scale +
+  scale_x_date(
+    limits = as.Date(c("2024-12-07", "2025-11-07")),
+    date_breaks = "6 weeks",
+    date_labels = "%b %d",
+    expand = expansion(mult = c(0.01, 0.08))
+  ) +
+  labs(
+    x = "Date",
+    y = "Fish",
+    title = "December release",
+    tag = "B"
+  ) +
+  common_theme
+
+# Combine panels and collect the shared legend
+abacus_plot <- (p_april | p_december) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom") &
+  guides(
+    colour = guide_colourbar(
+      barwidth = grid::unit(16, "cm"),
+      barheight = grid::unit(0.5, "cm")
+    )
+  )
+
+abacus_plot
+
+ggsave(
+  filename = "abacus_plot.png",
+  plot = abacus_plot,
+  width = 14,
+  height = 8,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+# Firth-penalized Cox proportional hazards model
+
+Only fish detected in the marine receiver array were included because the fate
+and observation time of undetected fish could not be established. Time was
+measured from release to the first inferred predation event. Fish without an
+inferred predation event were right-censored at their last marine detection.
+Total length was expressed in 5-cm units so that its hazard ratio represented
+the effect of a 5-cm increase in total length.
+
+```{r cox-data}
+# Prepare fish-level data for the Cox model
+cox_data <- fish_fates %>%
+  filter(
+    detected,
+    !is.na(tl),
+    !is.na(sex)
+  ) %>%
+  mutate(
+    # Predated fish end at predation; other fish end at their last detection
+    endpoint_dt = if_else(
+      predation,
+      predation_dt,
+      last_detection_dt
+    ),
+
+    # Time from release to predation or censoring
+    time_days = as.numeric(
+      difftime(
+        endpoint_dt,
+        release_dt,
+        units = "days"
+      )
+    ),
+
+    # Event indicator: 1 = inferred predation; 0 = censored
+    event = as.integer(predation),
+
+    # Convert total length from metres to units of 5 cm
+    tl_5cm = (tl * 100) / 5
+  ) %>%
+  filter(
+    is.finite(time_days),
+    time_days > 0
+  ) %>%
+  droplevels()
+
+# Confirm that usable observations and predation events remain
+stopifnot(
+  nrow(cox_data) > 0,
+  sum(cox_data$event) > 0
+)
+
+# Summarize observations included in the model
+cox_summary <- cox_data %>%
+  summarise(
+    n_fish = n(),
+    n_predation = sum(event),
+    n_censored = sum(event == 0),
+    mean_tl_cm = mean(tl * 100),
+    min_tl_cm = min(tl * 100),
+    max_tl_cm = max(tl * 100)
+  )
+
+knitr::kable(
+  cox_summary,
+  digits = 1,
+  caption = "Summary of Atlantic salmon kelts included in the Cox proportional hazards model."
+)
+```
+
+```{r fit-cox-model}
+# Fit the Firth-penalized Cox proportional hazards model
+cox_firth <- coxphf(
+  formula = Surv(time_days, event) ~ tl_5cm + sex,
+  data = cox_data,
+  firth = TRUE,
+  pl = TRUE
+)
+
+summary(cox_firth)
+```
+
+## Model checks
+
+Model assumptions were assessed using a standard Cox proportional hazards model
+with the same response and covariates as the Firth-penalized model. The standard
+model was used only to calculate diagnostic residuals and was not used for
+coefficient estimation or inference.
+
+### Proportional hazards assumption
+
+The proportional hazards assumption was assessed using scaled Schoenfeld
+residuals. A non-significant test indicates no evidence that a covariate's
+effect changes systematically over the observation period.
+
+```{r proportional-hazards-check, fig.width=9, fig.height=4.5}
+# Fit an equivalent standard Cox model for diagnostic purposes
+cox_diagnostic <- coxph(
+  formula = Surv(time_days, event) ~ tl_5cm + sex,
+  data = cox_data,
+  x = TRUE
+)
+
+# Test the proportional hazards assumption
+ph_test <- cox.zph(cox_diagnostic)
+
+ph_test
+
+# Plot scaled Schoenfeld residuals
+plot(
+  ph_test,
+  resid = TRUE,
+  se = TRUE
+)
+```
+
+The test for each covariate evaluates whether its scaled Schoenfeld residuals
+are associated with time. The global test evaluates the proportional hazards
+assumption for the model as a whole. P values greater than 0.05 indicate that
+there is insufficient evidence to reject the proportional hazards assumption.
+In the diagnostic plots, an approximately horizontal smoothed line suggests
+that the effect of the covariate remains reasonably constant through time.
+Wide confidence bands are expected because relatively few inferred predation
+events were observed.
+
+### Cox–Snell residuals
+
+Cox–Snell residuals were used to assess overall model fit. If the model
+adequately represents the data, the estimated cumulative hazard of the
+Cox–Snell residuals should approximately follow a straight line with an
+intercept of zero and slope of one.
+
+```{r cox-snell-check, fig.width=6.5, fig.height=6}
+# Extract martingale residuals from the diagnostic Cox model
+martingale_residuals <- residuals(
+  cox_diagnostic,
+  type = "martingale"
+)
+
+# Cox–Snell residual = event indicator - martingale residual
+cox_data_diagnostic <- cox_data %>%
+  mutate(
+    cox_snell = event - martingale_residuals
+  )
+
+# Estimate the cumulative hazard of the Cox–Snell residuals
+cox_snell_fit <- survfit(
+  Surv(cox_snell, event) ~ 1,
+  data = cox_data_diagnostic
+)
+
+# Retain finite cumulative-hazard estimates for plotting
+cox_snell_plot <- tibble(
+  residual = cox_snell_fit$time,
+  cumulative_hazard = -log(cox_snell_fit$surv)
+) %>%
+  filter(
+    is.finite(residual),
+    is.finite(cumulative_hazard)
+  )
+
+# Plot estimated cumulative hazard against Cox–Snell residuals
+ggplot(
+  cox_snell_plot,
+  aes(x = residual, y = cumulative_hazard)
+) +
+  geom_step(
+    linewidth = 1,
+    colour = "black"
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linewidth = 1,
+    linetype = "dashed",
+    colour = "red"
+  ) +
+  coord_equal() +
+  labs(
+    x = "Cox–Snell residual",
+    y = "Estimated cumulative hazard"
+  ) +
+  theme_classic(base_size = 14)
+```
+
+Close agreement between the estimated cumulative hazard and the dashed
+45-degree reference line indicates adequate overall model fit. Some divergence
+near the upper end of the residual distribution may occur because relatively
+few fish remain under observation at longer follow-up times. Given the limited
+number of inferred predation events, these diagnostic plots were interpreted
+cautiously.
+
+# Summary Table
+```{r}
+# Create a summary table for fish with inferred predation events
+
+# Last detection before the inferred predation event
+last_alive_detection <- det %>%
+  inner_join(
+    predation_events %>% select(fish, predation_dt),
+    by = "fish"
+  ) %>%
+  filter(dt < predation_dt) %>%
+  group_by(fish) %>%
+  slice_max(
+    order_by = dt,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  select(
+    fish,
+    last_alive_dt = dt
+  )
+
+# Temperature records and detections from the predation event onward
+post_predation_summary <- det %>%
+  inner_join(
+    predation_events %>% select(fish, predation_dt),
+    by = "fish"
+  ) %>%
+  filter(dt >= predation_dt) %>%
+  group_by(fish) %>%
+  summarise(
+    final_post_predation_dt = max(dt, na.rm = TRUE),
+
+    post_predation_min_temp = if_else(
+      all(is.na(temp)),
+      NA_real_,
+      min(temp, na.rm = TRUE)
+    ),
+
+    post_predation_max_temp = if_else(
+      all(is.na(temp)),
+      NA_real_,
+      max(temp, na.rm = TRUE)
+    ),
+
+    post_predation_mean_temp = if_else(
+      all(is.na(temp)),
+      NA_real_,
+      mean(temp, na.rm = TRUE)
+    ),
+
+    .groups = "drop"
+  )
+
+# Assemble the final table
+predation_table <- predation_events %>%
+  select(
+    fish,
+    predation_dt,
+    predation_temp
+  ) %>%
+  left_join(
+    meta %>%
+      select(fish, cohort, tl),
+    by = "fish"
+  ) %>%
+  left_join(
+    last_alive_detection,
+    by = "fish"
+  ) %>%
+  left_join(
+    post_predation_summary,
+    by = "fish"
+  ) %>%
+  mutate(
+    # Convert total length from metres to centimetres
+    total_length_cm = tl * 100,
+
+    # Interval from the final detection before predation to inferred predation
+    days_between_detections = as.numeric(
+      difftime(
+        predation_dt,
+        last_alive_dt,
+        units = "days"
+      )
+    ),
+
+    # Duration over which the tag was detected after inferred predation
+    days_detected_after_predation = as.numeric(
+      difftime(
+        final_post_predation_dt,
+        predation_dt,
+        units = "days"
+      )
+    ),
+
+    # Combine the minimum and maximum post-predation temperatures
+    post_predation_temp_range = if_else(
+      is.na(post_predation_min_temp) |
+        is.na(post_predation_max_temp),
+      NA_character_,
+      paste0(
+        round(post_predation_min_temp, 1),
+        "–",
+        round(post_predation_max_temp, 1)
+      )
+    )
+  ) %>%
+  transmute(
+    Fish = fish,
+    `Release cohort` = as.character(cohort),
+    `Total length (cm)` = round(total_length_cm, 1),
+    `Last alive detection date` = as.Date(last_alive_dt),
+    `Approximate predation date` = as.Date(predation_dt),
+    `Days between detections` = round(days_between_detections, 1),
+    `Predation temperature (°C)` = round(predation_temp, 1),
+    `Temperature range post-predation event (°C)` =
+      post_predation_temp_range,
+    `Mean post-predation temperature (°C)` =
+      round(post_predation_mean_temp, 1),
+    `Days detected after approximate predation date` =
+      round(days_detected_after_predation, 1)
+  ) %>%
+  arrange(`Approximate predation date`)
+
+predation_table
+
+knitr::kable(
+  predation_table,
+  align = "c",
+  caption = paste(
+    "Detection and temperature characteristics of Atlantic salmon kelts",
+    "with inferred predation events."
+  )
+)
+```
+
+```{r}
+readr::write_csv(
+  predation_table,
+  "predation_event_summary.csv",
+  na = "NA"
+)
+```
+
+
+
+# Reproducibility
+
+```{r session-info}
+sessionInfo()
+```

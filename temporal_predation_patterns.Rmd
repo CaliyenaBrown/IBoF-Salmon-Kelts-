@@ -1,0 +1,585 @@
+---
+title: "Temporal predation patterns"
+author: "Caliyena Brown"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(scales)
+```
+
+# Purpose
+
+This document identifies the timing of inferred predation events, quantifies
+the interval between the last confirmed alive detection and the first
+post-predation detection, and summarizes inferred predation events by month.
+
+# Import and prepare data
+
+```{r import-data}
+det <- readRDS("det_clean_no_release_site_det.rds")
+meta_tag <- readRDS("meta_clean.rds")
+predation_events <- readRDS("predation_events_clean.rds")
+
+# Convert tag-level metadata to one biological record per fish.
+meta <- meta_tag %>%
+  select(fish, sex, tl, fl, release_dt) %>%
+  distinct() %>%
+  mutate(
+    fish = as.integer(fish),
+    release_dt = as.POSIXct(release_dt, tz = "UTC"),
+    cohort = case_when(
+      month(release_dt) == 4 ~ "April",
+      month(release_dt) == 12 ~ "December",
+      TRUE ~ NA_character_
+    ),
+    cohort = factor(cohort, levels = c("April", "December"))
+  )
+
+stopifnot(
+  nrow(meta) == 101,
+  anyDuplicated(meta$fish) == 0
+)
+
+# Confirm the required detection columns are present.
+stopifnot(
+  all(c("fish", "temp", "dt") %in% names(det))
+)
+
+# Parse detection times as UTC, then convert them to Halifax local time without
+# changing the underlying instant represented by each timestamp.
+if (inherits(det$dt, "POSIXct")) {
+  det$dt <- with_tz(det$dt, tzone = "America/Halifax")
+} else {
+  det$dt <- with_tz(
+    ymd_hms(det$dt, tz = "UTC", quiet = TRUE),
+    tzone = "America/Halifax"
+  )
+}
+
+det <- det %>%
+  mutate(
+    fish = as.integer(fish),
+    temp = as.numeric(temp)
+  ) %>%
+  filter(
+    !is.na(fish),
+    !is.na(dt),
+    fish %in% meta$fish
+  ) %>%
+  arrange(fish, dt)
+```
+
+# Prepare inferred predation events
+
+The predation events used here were identified and validated in the
+predation-mortality analysis. The preceding valid temperature record was used
+to describe the temperature increase, and the immediately preceding detection
+from any transmitter belonging to the same fish was used to quantify temporal
+uncertainty.
+
+```{r prepare-events}
+# Convert predation timestamps to Halifax local time, matching the detections.
+if (inherits(predation_events$predation_dt, "POSIXct")) {
+  predation_events$predation_dt <- with_tz(
+    predation_events$predation_dt,
+    tzone = "America/Halifax"
+  )
+} else {
+  predation_events$predation_dt <- with_tz(
+    ymd_hms(predation_events$predation_dt, tz = "UTC", quiet = TRUE),
+    tzone = "America/Halifax"
+  )
+}
+
+predation_events <- predation_events %>%
+  mutate(fish = as.integer(fish))
+
+# Identify the preceding valid temperature record for every detection.
+temperature_detections <- det %>%
+  filter(!is.na(temp)) %>%
+  group_by(fish) %>%
+  arrange(dt, .by_group = TRUE) %>%
+  mutate(
+    previous_temperature_dt = lag(dt),
+    previous_temp = lag(temp),
+    temperature_increase = temp - previous_temp
+  ) %>%
+  ungroup()
+
+# Add the preceding temperature record to each finalized predation event.
+predation_events <- predation_events %>%
+  select(fish, predation_dt, predation_temp) %>%
+  left_join(
+    temperature_detections %>%
+      select(
+        fish,
+        detection_dt = dt,
+        previous_temperature_dt,
+        previous_temp,
+        temperature_increase
+      ),
+    by = c("fish", "predation_dt" = "detection_dt")
+  )
+
+# Identify the immediately preceding detection of any transmitter belonging to
+# the fish. This timestamp defines the temporal uncertainty interval.
+last_alive <- det %>%
+  inner_join(
+    predation_events %>% select(fish, predation_dt),
+    by = "fish"
+  ) %>%
+  filter(dt < predation_dt) %>%
+  group_by(fish) %>%
+  slice_max(dt, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    fish,
+    last_alive_dt = dt
+  )
+
+# Add uncertainty intervals, release cohort, and predation month.
+predation_events <- predation_events %>%
+  left_join(last_alive, by = "fish") %>%
+  left_join(
+    meta %>% select(fish, cohort),
+    by = "fish"
+  ) %>%
+  mutate(
+    uncertainty_hours = as.numeric(
+      difftime(predation_dt, last_alive_dt, units = "hours")
+    ),
+    uncertainty_days = uncertainty_hours / 24,
+    predation_month = month(
+      predation_dt,
+      label = TRUE,
+      abbr = FALSE
+    )
+  ) %>%
+  arrange(predation_dt)
+
+stopifnot(
+  nrow(predation_events) == 13,
+  anyDuplicated(predation_events$fish) == 0,
+  all(predation_events$predation_temp > 20),
+  all(!is.na(predation_events$last_alive_dt))
+)
+
+predation_events
+```
+
+# Temporal uncertainty
+
+```{r temporal-uncertainty}
+temporal_uncertainty_summary <- predation_events %>%
+  summarise(
+    n_events = n(),
+    median_hours = median(uncertainty_hours, na.rm = TRUE),
+    minimum_hours = min(uncertainty_hours, na.rm = TRUE),
+    maximum_hours = max(uncertainty_hours, na.rm = TRUE),
+    mean_hours = mean(uncertainty_hours, na.rm = TRUE)
+  )
+
+temporal_event_table <- predation_events %>%
+  transmute(
+    Fish = fish,
+    `Release cohort` = as.character(cohort),
+    `Last confirmed alive detection` = last_alive_dt,
+    `Previous temperature detection` = previous_temperature_dt,
+    `Preceding temperature (°C)` = round(previous_temp, 1),
+    `Approximate predation detection` = predation_dt,
+    `Predation temperature (°C)` = round(predation_temp, 1),
+    `Temperature increase (°C)` = round(temperature_increase, 1),
+    `Uncertainty interval (hours)` = round(uncertainty_hours, 1),
+    `Uncertainty interval (days)` = round(uncertainty_days, 1),
+    Month = as.character(predation_month)
+  )
+
+knitr::kable(
+  temporal_uncertainty_summary,
+  digits = 1,
+  caption = paste(
+    "Summary of the intervals between the last confirmed alive detection",
+    "and first detection consistent with inferred predation."
+  )
+)
+
+knitr::kable(
+  temporal_event_table,
+  align = "c",
+  caption = paste(
+    "Timing and temporal uncertainty of inferred predation events in",
+    "Atlantic salmon kelts."
+  )
+)
+
+write_csv(
+  temporal_event_table,
+  "temporal_predation_event_summary.csv",
+  na = "NA"
+)
+```
+
+# Temperature histories
+
+```{r temperature-histories, fig.width=10, fig.height=13, fig.cap="Temperature histories of Atlantic salmon kelts with inferred predation events. Each panel represents one fish. Black crosses identify the first detection above 20°C for which the temperature history was considered consistent with inferred predation."}
+predated_fish <- predation_events$fish
+
+temperature_plot_data <- temperature_detections %>%
+  filter(fish %in% predated_fish) %>%
+  mutate(
+    fish = factor(
+      fish,
+      levels = sort(unique(fish))
+    )
+  ) %>%
+  arrange(temp)
+
+predation_plot_data <- predation_events %>%
+  mutate(
+    fish = factor(
+      fish,
+      levels = levels(temperature_plot_data$fish)
+    )
+  )
+
+temperature_history_plot <- ggplot(
+  temperature_plot_data,
+  aes(x = dt, y = temp, colour = temp, group = fish)
+) +
+  geom_line(
+    linewidth = 0.5,
+    alpha = 0.6,
+    colour = "grey55"
+  ) +
+  geom_point(size = 2.2, alpha = 0.75) +
+  geom_point(
+    data = predation_plot_data,
+    aes(x = predation_dt, y = predation_temp),
+    inherit.aes = FALSE,
+    shape = 4,
+    colour = "black",
+    size = 4.5,
+    stroke = 1.1
+  ) +
+  facet_wrap(~ fish, scales = "free_x", ncol = 3) +
+  scale_colour_viridis_c(
+    option = "plasma",
+    limits = c(0, 40),
+    oob = scales::squish,
+    name = "Temperature (°C)",
+    guide = guide_colourbar(
+      barheight = grid::unit(4.5, "cm")
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0, 40),
+    breaks = seq(0, 40, by = 10)
+  ) +
+  scale_x_datetime(date_labels = "%d-%b") +
+  labs(
+    x = "Date (day–month)",
+    y = "Temperature (°C)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_text(size = 14),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 11)
+  )
+
+temperature_history_plot
+
+ggsave(
+  "predation_temperature_histories.png",
+  temperature_history_plot,
+  width = 10,
+  height = 13,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+# Monthly predation patterns
+
+Predation events are summarized by month of year. Fish availability represents
+the number of detected fish under observation during at least part of each
+month. Predated fish remain available through the month containing their
+inferred predation event; other detected fish remain available through the
+month of their final detection.
+
+```{r monthly-data}
+month_levels <- month.name
+
+# Create a complete 12-month reference table
+month_grid <- tibble(
+  month = month_levels
+)
+
+# Count inferred predation events by month
+predation_month_counts <- predation_events %>%
+  mutate(
+    month = as.character(predation_month)
+  ) %>%
+  count(
+    month,
+    name = "n_predation"
+  )
+
+# Establish the final observation time for each detected fish
+last_detections <- det %>%
+  group_by(fish) %>%
+  summarise(
+    last_detection_dt = max(dt),
+    .groups = "drop"
+  )
+
+# Determine the months during which each detected fish was available
+availability_data <- meta %>%
+  inner_join(
+    last_detections,
+    by = "fish"
+  ) %>%
+  left_join(
+    predation_events %>%
+      select(fish, predation_dt),
+    by = "fish"
+  ) %>%
+  mutate(
+    release_dt_local = with_tz(
+      release_dt,
+      tzone = "America/Halifax"
+    ),
+
+    # Predated fish end at predation; other fish end at last detection
+    endpoint_dt = if_else(
+      !is.na(predation_dt),
+      predation_dt,
+      last_detection_dt
+    ),
+
+    start_month = as.Date(
+      floor_date(release_dt_local, unit = "month")
+    ),
+
+    end_month = as.Date(
+      floor_date(endpoint_dt, unit = "month")
+    )
+  ) %>%
+  filter(end_month >= start_month) %>%
+  rowwise() %>%
+  mutate(
+    month_sequence = list(
+      seq.Date(
+        from = start_month,
+        to = end_month,
+        by = "month"
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  unnest(month_sequence) %>%
+  mutate(
+    # Store month as character to avoid ordered-factor conflicts
+    month = month.name[lubridate::month(month_sequence)]
+  )
+
+# Count fish available during each month
+available_month_counts <- availability_data %>%
+  count(
+    month,
+    name = "n_available"
+  )
+
+# Combine counts with the complete 12-month reference table
+monthly_summary <- month_grid %>%
+  left_join(
+    predation_month_counts,
+    by = "month"
+  ) %>%
+  left_join(
+    available_month_counts,
+    by = "month"
+  ) %>%
+  mutate(
+    n_predation = replace_na(n_predation, 0L),
+    n_available = replace_na(n_available, 0L),
+
+    events_per_100_available = if_else(
+      n_available > 0,
+      100 * n_predation / n_available,
+      NA_real_
+    ),
+
+    # Convert month to an ordered plotting factor only after all joins
+    month = factor(
+      month,
+      levels = month_levels,
+      ordered = TRUE
+    )
+  )
+
+knitr::kable(
+  monthly_summary,
+  digits = 1,
+  caption = paste(
+    "Monthly inferred predation events and numbers of detected kelts",
+    "available for observation."
+  )
+)
+
+write_csv(
+  monthly_summary,
+  "monthly_predation_summary.csv",
+  na = "NA"
+)
+```
+
+```{r monthly-figure, fig.width=10, fig.height=6.5, fig.cap="Monthly timing of inferred predation events and numbers of detected Atlantic salmon kelts available for observation. Bars show the number of inferred predation events, and the black line shows the number of fish available during each month."}
+
+# Colours used for monthly predation-event bars
+month_colours <- c(
+  "January" = "#D9D9D9",
+  "February" = "#D9D9D9",
+  "March" = "#D9D9D9",
+  "April" = "#E4A3A9",
+  "May" = "#D3D3D3",
+  "June" = "#D8576E",
+  "July" = "#FFC000",
+  "August" = "#4EA72E",
+  "September" = "#13501B",
+  "October" = "#D9D9D9",
+  "November" = "#D9D9D9",
+  "December" = "#D9D9D9"
+)
+
+# Calculate the scaling needed to display fish availability on the same plot
+scale_factor <- max(
+  monthly_summary$n_available,
+  na.rm = TRUE
+) / max(
+  monthly_summary$n_predation,
+  na.rm = TRUE
+)
+
+# Scale fish availability to the range of the left axis
+monthly_plot_data <- monthly_summary %>%
+  mutate(
+    n_available_scaled = n_available / scale_factor
+  )
+
+# Create the combined monthly plot
+monthly_timing_plot <- ggplot(
+  monthly_plot_data,
+  aes(x = month)
+) +
+  # Predation-event bars
+  geom_col(
+    aes(
+      y = n_predation,
+      fill = month
+    ),
+    width = 0.75,
+    colour = "black",
+    linewidth = 0.3
+  ) +
+  # Fish-availability line
+  geom_line(
+    aes(
+      y = n_available_scaled,
+      group = 1
+    ),
+    linewidth = 1.2,
+    colour = "black"
+  ) +
+  geom_point(
+    aes(y = n_available_scaled),
+    size = 3,
+    shape = 21,
+    fill = "black",
+    colour = "black",
+    stroke = 1
+  ) +
+  scale_fill_manual(
+    values = month_colours,
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    name = "Number of inferred predation events",
+    breaks = scales::breaks_width(1),
+    expand = expansion(mult = c(0, 0.08)),
+
+    # Convert the scaled line back to fish counts on the right axis
+    sec.axis = sec_axis(
+      trans = ~ . * scale_factor,
+      name = "Number of fish available",
+      breaks = scales::breaks_pretty()
+    )
+  ) +
+  labs(
+    x = "Month"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    axis.title.x = element_text(
+      size = 16,
+      margin = margin(t = 10)
+    ),
+    axis.title.y.left = element_text(
+      size = 15,
+      margin = margin(r = 10)
+    ),
+    axis.title.y.right = element_text(
+      size = 15,
+      margin = margin(l = 10)
+    ),
+    axis.text = element_text(size = 13),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+monthly_timing_plot
+
+ggsave(
+  filename = "monthly_predation_patterns.png",
+  plot = monthly_timing_plot,
+  width = 10,
+  height = 6.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+# Reproducibility
+
+```{r session-info}
+sessionInfo()
+```

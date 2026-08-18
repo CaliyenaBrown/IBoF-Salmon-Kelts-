@@ -1,0 +1,1395 @@
+---
+title: "Temporal habitat use of inner Bay of Fundy Atlantic salmon kelts"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+date: "2026-08-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(mgcv)
+library(sf)
+library(scales)
+```
+
+# Purpose
+
+This analysis evaluates monthly spatial patterns in the presence of tagged inner
+Bay of Fundy Atlantic salmon kelts. Detections are truncated at each inferred
+predation event, aggregated to receiver station by year-month, and modelled using a
+binomial generalized additive model (GAM). Month-specific spatial smooths allow
+the spatial pattern of receiver use to vary among calendar months.
+
+# Analysis settings
+
+```{r settings}
+crs_geographic <- 4326
+crs_projected <- 32620
+minimum_fish_per_month <- 5L
+initial_basis_dimension <- 30L
+candidate_basis_dimension <- 50L
+prediction_resolution_m <- 1000
+
+# Final month included in the study period
+study_end_month <- as.Date("2025-10-01")
+
+month_labels <- setNames(month.name, 1:12)
+```
+
+# Import clean data
+
+The analysis uses the cleaned detections, finalized predation events, biological
+metadata, and an analysis-ready receiver table. The receiver table contains one 
+row per station in the primary Bay of Fundy receiver grid, with station 
+coordinates recorded as decimal degrees. Stations outside the primary receiver 
+grid were removed when preparing this file.
+
+Required receiver columns are `station`, `lon`, and `lat`.
+
+```{r import-data}
+det <- readRDS("det_clean_no_release_site_det.rds")
+predation_events <- readRDS("predation_events_clean.rds")
+meta <- readRDS("meta_clean.rds")
+
+receivers <- read_csv(
+  "recs_meta.csv",
+  show_col_types = FALSE
+)
+
+# Polygon layer containing DFO marine habitat areas 3–8
+gdb_path <- "IBOF_MarineCriticalHabitats.gdb"
+
+habitat_areas <- st_read(
+  gdb_path,
+  layer = "IBOF_Crit_Hab_Polygons_EqAr",
+  quiet = TRUE
+) %>%
+  filter(CH_UNIT_ID %in% 3:8)
+
+stopifnot(
+  nrow(habitat_areas) == 6,
+  all(sort(habitat_areas$CH_UNIT_ID) == 3:8)
+)
+
+required_det_columns <- c(
+  "fish", "dt", "receiver", "station", "lon", "lat"
+)
+
+required_predation_columns <- c(
+  "fish", "predation_dt"
+)
+
+required_meta_columns <- c(
+  "fish", "release_dt"
+)
+
+required_receiver_columns <- c(
+  "station", "lon", "lat"
+)
+
+stopifnot(
+  all(required_det_columns %in% names(det)),
+  all(required_predation_columns %in% names(predation_events)),
+  all(required_meta_columns %in% names(meta)),
+  all(required_receiver_columns %in% names(receivers))
+)
+```
+
+# Prepare detections and receiver stations
+
+```{r prepare-data}
+# Convert date-time fields to UTC
+parse_utc <- function(x) {
+  if (inherits(x, "POSIXt")) {
+    return(with_tz(x, tzone = "UTC"))
+  }
+
+  if (inherits(x, "Date")) {
+    return(as.POSIXct(x, tz = "UTC"))
+  }
+
+  parse_date_time(
+    x,
+    orders = c(
+      "ymd HMS",
+      "ymd HM",
+      "ymd"
+    ),
+    tz = "UTC",
+    quiet = TRUE
+  )
+}
+
+# Prepare detection data
+det <- det %>%
+  mutate(
+    fish = as.integer(fish),
+    station = as.character(station),
+    receiver = as.character(receiver),
+    dt = parse_utc(dt),
+    lon = as.numeric(lon),
+    lat = as.numeric(lat)
+  ) %>%
+  filter(
+    !is.na(fish),
+    !is.na(station),
+    !is.na(dt)
+  ) %>%
+  arrange(fish, dt)
+
+# Prepare finalized inferred predation events
+predation_events <- predation_events %>%
+  transmute(
+    fish = as.integer(fish),
+    predation_dt = parse_utc(predation_dt)
+  ) %>%
+  distinct(fish, .keep_all = TRUE)
+
+# Prepare biological metadata
+meta <- meta %>%
+  transmute(
+    fish = as.integer(fish),
+    release_dt = parse_utc(release_dt)
+  ) %>%
+  distinct(fish, .keep_all = TRUE) %>%
+  mutate(
+    cohort = case_when(
+      month(release_dt) == 4 ~ "April",
+      month(release_dt) == 12 ~ "December",
+      TRUE ~ NA_character_
+    ),
+    cohort = factor(
+      cohort,
+      levels = c("April", "December")
+    )
+  )
+
+stopifnot(!anyNA(meta$cohort))
+
+# Prepare the receiver stations in the primary receiver grid
+receivers <- receivers %>%
+  transmute(
+    station = as.character(station),
+    lon = as.numeric(lon),
+    lat = as.numeric(lat)
+  ) %>%
+  filter(
+    !is.na(station),
+    !is.na(lon),
+    !is.na(lat)
+  ) %>%
+  distinct(station, .keep_all = TRUE)
+
+# Confirm that receiver stations and predation events are unique
+stopifnot(
+  anyDuplicated(receivers$station) == 0,
+  nrow(predation_events) == 13,
+  anyDuplicated(predation_events$fish) == 0,
+  anyDuplicated(meta$fish) == 0
+)
+
+# Exclude detections after each fish's inferred predation event
+det_analysis <- det %>%
+  left_join(
+    predation_events,
+    by = "fish"
+  ) %>%
+  filter(
+    is.na(predation_dt) |
+      dt <= predation_dt
+  ) %>%
+  select(-predation_dt)
+
+# Retain only stations in the cleaned primary receiver grid
+det_analysis <- det_analysis %>%
+  semi_join(
+    receivers %>% select(station),
+    by = "station"
+  ) %>%
+  mutate(
+    ym = floor_date(dt, unit = "month"),
+    month = month(ym)
+  )
+
+stopifnot(nrow(det_analysis) > 0)
+```
+
+# Select calendar months
+
+Analyses are restricted to calendar months in which at least five unique kelts
+were detected within the primary receiver grid after applying the predation
+truncation.
+
+```{r select-months}
+fish_month_count <- det_analysis %>%
+  group_by(month) %>%
+  summarise(
+    n_fish = n_distinct(fish),
+    n_detections = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(month) %>%
+  mutate(
+    month_name = month.name[month]
+  )
+
+months_keep <- fish_month_count %>%
+  filter(
+    n_fish >= minimum_fish_per_month
+  ) %>%
+  pull(month) %>%
+  sort()
+
+stopifnot(length(months_keep) >= 2)
+
+knitr::kable(
+  fish_month_count,
+  caption = paste(
+    "Numbers of unique tagged kelts and detections by",
+    "calendar month within the primary receiver grid."
+  )
+)
+
+fish_by_month_plot <- fish_month_count %>%
+  mutate(
+    month_name = factor(
+      month_name,
+      levels = month.name
+    )
+  ) %>%
+  ggplot(
+    aes(
+      x = month_name,
+      y = n_fish
+    )
+  ) +
+  geom_col(
+    fill = "grey55",
+    colour = "black",
+    linewidth = 0.3
+  ) +
+  geom_hline(
+    yintercept = minimum_fish_per_month,
+    linetype = "dashed"
+  ) +
+  labs(
+    x = "Month",
+    y = "Number of unique kelts detected"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+fish_by_month_plot
+
+ggsave(
+  filename = "gam_fish_detected_by_month.png",
+  plot = fish_by_month_plot,
+  width = 8,
+  height = 5.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+# Summarize detections by year and release cohort
+
+Detections from the same calendar month were pooled across study years and
+release cohorts for the GAM. The following tables show how each release cohort
+and study year contributed to the pooled monthly data.
+
+```{r monthly-cohort-summary}
+# Add release cohort to the detection data
+detections_by_cohort <- det_analysis %>%
+  left_join(
+    meta %>%
+      select(
+        fish,
+        cohort
+      ),
+    by = "fish"
+  ) %>%
+  mutate(
+    detection_year = year(dt),
+    calendar_month = month(dt)
+  )
+
+stopifnot(!anyNA(detections_by_cohort$cohort))
+
+# Count unique fish, stations, and detections
+monthly_cohort_counts <- detections_by_cohort %>%
+  group_by(
+    detection_year,
+    calendar_month,
+    cohort
+  ) %>%
+  summarise(
+    n_unique_fish = n_distinct(fish),
+    n_stations = n_distinct(station),
+    n_detections = n(),
+    .groups = "drop"
+  )
+
+# Include combinations with no detections
+monthly_cohort_summary <- monthly_cohort_counts %>%
+  complete(
+    detection_year,
+    calendar_month = 1:12,
+    cohort,
+    fill = list(
+      n_unique_fish = 0L,
+      n_stations = 0L,
+      n_detections = 0L
+    )
+  ) %>%
+  mutate(
+    month_name = month.name[calendar_month]
+  ) %>%
+  arrange(
+    detection_year,
+    calendar_month,
+    cohort
+  ) %>%
+  select(
+    detection_year,
+    calendar_month,
+    month_name,
+    cohort,
+    n_unique_fish,
+    n_stations,
+    n_detections
+  )
+
+knitr::kable(
+  monthly_cohort_summary,
+  caption = paste(
+    "Numbers of unique kelts, receiver stations, and detections",
+    "by year, calendar month, and release cohort."
+  )
+)
+
+write_csv(
+  monthly_cohort_summary,
+  "gam_monthly_cohort_detection_summary.csv",
+  na = "NA"
+)
+```
+
+# Check for April-cohort detections during 2025
+
+```{r april-cohort-2025}
+april_cohort_2025 <- detections_by_cohort %>%
+  filter(
+    cohort == "April",
+    detection_year == 2025
+  ) %>%
+  summarise(
+    n_unique_fish = n_distinct(fish),
+    fish_ids = if_else(
+      n_unique_fish > 0,
+      paste(
+        sort(unique(fish)),
+        collapse = ", "
+      ),
+      "None"
+    )
+  )
+
+knitr::kable(
+  april_cohort_2025,
+  caption = "April-release cohort detections recorded during 2025."
+)
+```
+
+# Visualize monthly sample sizes by cohort and year
+
+```{r monthly-cohort-figure, fig.width=11, fig.height=6}
+monthly_cohort_plot_data <- monthly_cohort_summary %>%
+  mutate(
+    month_name = factor(
+      month_name,
+      levels = month.name
+    )
+  )
+
+monthly_cohort_plot <- ggplot(
+  monthly_cohort_plot_data,
+  aes(
+    x = month_name,
+    y = n_unique_fish,
+    fill = cohort
+  )
+) +
+  geom_col(
+    position = "dodge",
+    colour = "black",
+    linewidth = 0.25
+  ) +
+  geom_hline(
+    yintercept = minimum_fish_per_month,
+    linetype = "dashed",
+    colour = "black"
+  ) +
+  facet_wrap(
+    ~ detection_year,
+    ncol = 1
+  ) +
+  scale_fill_manual(
+    values = c(
+      "April" = "#E76F51",
+      "December" = "#457B9D"
+    ),
+    name = "Release cohort"
+  ) +
+  labs(
+    x = "Calendar month",
+    y = "Number of unique kelts detected"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    strip.background = element_blank(),
+    strip.text = element_text(
+      face = "bold",
+      size = 13
+    ),
+    legend.position = "bottom"
+  )
+
+monthly_cohort_plot
+
+ggsave(
+  filename = "gam_monthly_fish_by_cohort_and_year.png",
+  plot = monthly_cohort_plot,
+  width = 11,
+  height = 6,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+# Build receiver-station by year-month observations
+
+The presence–absence dataset includes all stations in the cleaned primary
+receiver grid. Each station is treated as available for observation throughout
+the study period because receiver coverage within this grid was considered
+consistent. Presence indicates that at least one tagged kelt was detected at a
+station during a given year-month.
+
+```{r receiver-month-data}
+# Convert receiver-station coordinates to UTM Zone 20N
+receiver_stations_sf <- receivers %>%
+  st_as_sf(
+    coords = c("lon", "lat"),
+    crs = crs_geographic,
+    remove = FALSE
+  ) %>%
+  st_transform(crs_projected)
+
+station_coordinates <- st_coordinates(
+  receiver_stations_sf
+)
+
+receiver_stations <- receiver_stations_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    x = station_coordinates[, 1],
+    y = station_coordinates[, 2]
+  )
+
+# Confirm that all retained detection stations have receiver metadata
+unmatched_detection_stations <- det_analysis %>%
+  distinct(station) %>%
+  anti_join(
+    receiver_stations %>%
+      select(station),
+    by = "station"
+  )
+
+stopifnot(nrow(unmatched_detection_stations) == 0)
+
+# Define the study period
+first_release_month <- floor_date(
+  min(meta$release_dt, na.rm = TRUE),
+  unit = "month"
+)
+
+study_end_datetime <- as.POSIXct(
+  study_end_month,
+  tz = "UTC"
+)
+
+stopifnot(study_end_datetime >= first_release_month)
+
+# Create the sequence of year-months represented in the analysis
+ym_sequence <- seq(
+  from = first_release_month,
+  to = study_end_datetime,
+  by = "1 month"
+)
+
+# Retain only calendar months meeting the five-fish criterion
+ym_sequence <- ym_sequence[
+  month(ym_sequence) %in% months_keep
+]
+
+# Create the complete station-by-year-month grid
+receiver_effort <- expand_grid(
+  station = receiver_stations$station,
+  ym = ym_sequence
+) %>%
+  left_join(
+    receiver_stations,
+    by = "station"
+  ) %>%
+  mutate(
+    month = month(ym)
+  )
+
+# Summarize observed detections to station-by-year-month presence
+receiver_month_observed <- det_analysis %>%
+  filter(
+    month %in% months_keep
+  ) %>%
+  group_by(
+    station,
+    ym
+  ) %>%
+  summarise(
+    present = 1L,
+    n_detections = n(),
+    n_fish = n_distinct(fish),
+    .groups = "drop"
+  )
+
+# Join observations to the complete grid and fill absences
+receiver_month_presence <- receiver_effort %>%
+  left_join(
+    receiver_month_observed,
+    by = c(
+      "station",
+      "ym"
+    )
+  ) %>%
+  mutate(
+    present = replace_na(present, 0L),
+    n_detections = replace_na(n_detections, 0L),
+    n_fish = replace_na(n_fish, 0L),
+    month_f = factor(
+      month,
+      levels = months_keep
+    )
+  )
+
+stopifnot(
+  nrow(receiver_month_presence) > 0,
+  all(receiver_month_presence$present %in% c(0L, 1L)),
+  !anyNA(receiver_month_presence$x),
+  !anyNA(receiver_month_presence$y),
+  !anyNA(receiver_month_presence$month_f)
+)
+
+# Summarize the model dataset by calendar month
+receiver_month_summary <- receiver_month_presence %>%
+  group_by(month_f) %>%
+  summarise(
+    n_station_months = n(),
+    n_stations = n_distinct(station),
+    n_presences = sum(present),
+    observed_presence_rate = mean(present),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  receiver_month_summary,
+  digits = 3,
+  caption = paste(
+    "Receiver-station by year-month observations used",
+    "in the binomial generalized additive model."
+  )
+)
+```
+
+# Fit the binomial GAM (attempt 1 with K = 30)
+
+Calendar month is included as a categorical fixed effect. A separate
+two-dimensional thin-plate regression spline is estimated for each retained
+month. The default factor contrasts express parametric month coefficients
+relative to the first retained month.
+
+```{r fit-k30}
+gam_k30 <- bam(
+  present ~ month_f +
+    s(
+      x,
+      y,
+      by = month_f,
+      k = initial_basis_dimension,
+      bs = "tp"
+    ),
+  family = binomial(link = "logit"),
+  method = "fREML",
+  discrete = TRUE,
+  select = TRUE,
+  data = receiver_month_presence
+)
+
+summary(gam_k30)
+anova(gam_k30)
+```
+
+# Initial model estimates
+
+Odds ratios below describe parametric differences from the reference month.
+They do not summarize the month-specific spatial smooths.
+
+```{r month-odds-ratios}
+parametric_table_k30 <- as.data.frame(summary(gam_k30)$p.table) %>%
+  tibble::rownames_to_column("term") %>%
+  rename(
+    estimate = Estimate,
+    standard_error = `Std. Error`,
+    statistic = `z value`,
+    p_value = `Pr(>|z|)`
+  ) %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    odds_ratio_lower = exp(estimate - 1.96 * standard_error),
+    odds_ratio_upper = exp(estimate + 1.96 * standard_error)
+  )
+
+knitr::kable(
+  parametric_table_k30,
+  digits = 3,
+  caption = "Parametric coefficients and odds ratios for the initial k = 30 model."
+)
+```
+
+# Initial model checks
+
+For a binomial model, raw residuals are not expected to follow a normal
+distribution. Diagnostics therefore focus on basis dimensions, concurvity,
+calibration, and residual autocorrelation rather than residual normality.
+
+```{r check-k30, fig.width=10, fig.height=8}
+set.seed(123)
+gam.check(gam_k30)
+
+concurvity_results <- concurvity(
+  gam_k30,
+  full = TRUE
+)
+
+concurvity_results
+
+acf(
+  residuals(gam_k30, type = "deviance"),
+  main = "ACF of deviance residuals: k = 30"
+)
+```
+
+```{r calibration-k30, fig.width=11, fig.height=7}
+calibration_data_k30 <- receiver_month_presence %>%
+  mutate(
+    predicted_probability = predict(
+      gam_k30,
+      type = "response"
+    ),
+    probability_bin = cut(
+      predicted_probability,
+      breaks = seq(0, 1, by = 0.1),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(month_f, probability_bin) %>%
+  summarise(
+    observed_rate = mean(present),
+    predicted_rate = mean(predicted_probability),
+    n = n(),
+    .groups = "drop"
+  )
+
+calibration_plot_k30 <- ggplot(
+  calibration_data_k30,
+  aes(
+    x = predicted_rate,
+    y = observed_rate,
+    size = n
+  )
+) +
+  geom_point(alpha = 0.75) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    colour = "red"
+  ) +
+  facet_wrap(
+    ~ month_f,
+    labeller = as_labeller(month_labels)
+  ) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    x = "Mean predicted probability",
+    y = "Observed presence rate",
+    size = "Station-months"
+  ) +
+  theme_bw(base_size = 12)
+
+calibration_plot_k30
+```
+
+# Fit and check the k = 50 candidate model
+
+```{r fit-k50}
+gam_k50 <- bam(
+  present ~ month_f +
+    s(
+      x,
+      y,
+      by = month_f,
+      k = candidate_basis_dimension,
+      bs = "tp"
+    ),
+  family = binomial(link = "logit"),
+  method = "fREML",
+  discrete = TRUE,
+  select = TRUE,
+  data = receiver_month_presence
+)
+
+summary(gam_k50)
+anova(gam_k50)
+```
+
+```{r check-k50, fig.width=10, fig.height=8}
+set.seed(123)
+gam.check(gam_k50)
+```
+
+# Compare predictions from the two models 
+
+```{r compare-predictions}
+k_comparison <- receiver_month_presence %>%
+  mutate(
+    prediction_k30 = predict(
+      gam_k30,
+      type = "response"
+    ),
+    prediction_k50 = predict(
+      gam_k50,
+      type = "response"
+    ),
+    absolute_difference = abs(
+      prediction_k50 - prediction_k30
+    )
+  )
+
+prediction_comparison <- k_comparison %>%
+  summarise(
+    prediction_correlation = cor(
+      prediction_k30,
+      prediction_k50
+    ),
+    mean_absolute_difference = mean(
+      absolute_difference
+    ),
+    maximum_absolute_difference = max(
+      absolute_difference
+    )
+  )
+
+knitr::kable(
+  prediction_comparison,
+  digits = 4,
+  caption = "Comparison of fitted probabilities from the candidate GAMs."
+)
+```
+
+# Compare model summaries 
+
+```{r compare-model-fit}
+model_comparison <- tibble(
+  model = c("k = 30", "k = 50"),
+  deviance_explained = c(
+    summary(gam_k30)$dev.expl,
+    summary(gam_k50)$dev.expl
+  ),
+  adjusted_r_squared = c(
+    summary(gam_k30)$r.sq,
+    summary(gam_k50)$r.sq
+  ),
+  fREML_score = c(
+    gam_k30$gcv.ubre,
+    gam_k50$gcv.ubre
+  )
+)
+
+knitr::kable(
+  model_comparison,
+  digits = 4,
+  caption = "Fit statistics for the candidate basis dimensions."
+)
+```
+
+A basis dimension of `k = 50` was selected following comparison with the initial
+`k = 30` model. The larger basis dimension modestly improved model fit and
+allowed additional spatial complexity, although predictions from the two models
+remained strongly correlated. All subsequent estimates and spatial predictions
+use the selected `k = 50` model.
+
+```{r select-final-model}
+gam_presence <- gam_k50
+```
+
+# Final month effects and odds ratios
+
+Odds ratios describe parametric differences from the first retained calendar
+month. They do not summarize the month-specific spatial smooths.
+
+```{r final-month-odds-ratios}
+parametric_table <- as.data.frame(summary(gam_presence)$p.table) %>%
+  tibble::rownames_to_column("term") %>%
+  rename(
+    estimate = Estimate,
+    standard_error = `Std. Error`,
+    statistic = `z value`,
+    p_value = `Pr(>|z|)`
+  ) %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    odds_ratio_lower = exp(estimate - 1.96 * standard_error),
+    odds_ratio_upper = exp(estimate + 1.96 * standard_error)
+  )
+
+knitr::kable(
+  parametric_table,
+  digits = 3,
+  caption = "Parametric coefficients and odds ratios from the final k = 50 GAM."
+)
+
+write_csv(
+  parametric_table,
+  "gam_month_parametric_effects.csv",
+  na = "NA"
+)
+```
+
+```{r final-model-diagnostics}
+final_concurvity <- concurvity(
+  gam_presence,
+  full = TRUE
+)
+
+final_concurvity
+```
+
+```{r final-residual-acf, fig.width=8, fig.height=6}
+acf(
+  residuals(gam_presence, type = "deviance"),
+  main = "ACF of deviance residuals: final k = 50 model"
+)
+```
+
+```{r final-calibration, fig.width=11, fig.height=7}
+calibration_data <- receiver_month_presence %>%
+  mutate(
+    predicted_probability = predict(
+      gam_presence,
+      type = "response"
+    ),
+    probability_bin = cut(
+      predicted_probability,
+      breaks = seq(0, 1, by = 0.1),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(month_f, probability_bin) %>%
+  summarise(
+    observed_rate = mean(present),
+    predicted_rate = mean(predicted_probability),
+    n = n(),
+    .groups = "drop"
+  )
+
+calibration_plot <- ggplot(
+  calibration_data,
+  aes(x = predicted_rate, y = observed_rate, size = n)
+) +
+  geom_point(alpha = 0.75) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    colour = "red"
+  ) +
+  facet_wrap(
+    ~ month_f,
+    labeller = as_labeller(month_labels)
+  ) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    x = "Mean predicted probability",
+    y = "Observed presence rate",
+    size = "Station-months"
+  ) +
+  theme_bw(base_size = 12)
+
+calibration_plot
+```
+
+# Generate spatial predictions
+
+Predictions are generated over a 1-km grid within the convex hull of the
+analysis receivers and are masked to remove land. Predictions represent the
+estimated probability that at least one tagged kelt was detected at a receiver
+location during a year-month, conditional on the fitted monthly pattern.
+
+```{r prediction-grid}
+# Use one coordinate for each receiver station represented in the model
+model_stations <- receiver_month_presence %>%
+  distinct(
+    station,
+    lon,
+    lat,
+    x,
+    y
+  )
+
+model_stations_sf <- model_stations %>%
+  st_as_sf(
+    coords = c("x", "y"),
+    crs = crs_projected,
+    remove = FALSE
+  )
+
+receiver_hull <- model_stations_sf %>%
+  st_union() %>%
+  st_convex_hull()
+
+receiver_bbox <- st_bbox(receiver_hull)
+
+grid_coordinates <- expand_grid(
+  x = seq(
+    receiver_bbox[["xmin"]],
+    receiver_bbox[["xmax"]],
+    by = prediction_resolution_m
+  ),
+  y = seq(
+    receiver_bbox[["ymin"]],
+    receiver_bbox[["ymax"]],
+    by = prediction_resolution_m
+  )
+)
+
+prediction_grid_sf <- grid_coordinates %>%
+  st_as_sf(
+    coords = c("x", "y"),
+    crs = crs_projected,
+    remove = FALSE
+  )
+
+inside_receiver_hull <- lengths(
+  st_within(prediction_grid_sf, receiver_hull)
+) > 0
+
+prediction_grid_sf <- prediction_grid_sf[inside_receiver_hull, ]
+
+# Natural Earth land is used only to mask prediction cells over land.
+land <- rnaturalearth::ne_countries(
+  scale = "large",
+  returnclass = "sf"
+) %>%
+  filter(admin %in% c("Canada", "United States of America")) %>%
+  st_transform(crs_projected) %>%
+  st_make_valid()
+
+land_crop <- suppressWarnings(
+  st_crop(land, receiver_bbox)
+)
+
+on_land <- lengths(
+  st_intersects(prediction_grid_sf, land_crop)
+) > 0
+
+prediction_grid_sf <- prediction_grid_sf[!on_land, ]
+
+prediction_data <- expand_grid(
+  grid_row = seq_len(nrow(prediction_grid_sf)),
+  month = months_keep
+) %>%
+  left_join(
+    prediction_grid_sf %>%
+      st_drop_geometry() %>%
+      mutate(grid_row = row_number()),
+    by = "grid_row"
+  ) %>%
+  mutate(
+    month_f = factor(month, levels = months_keep)
+  )
+
+prediction_data$predicted_probability <- predict(
+  gam_presence,
+  newdata = prediction_data,
+  type = "response"
+)
+
+stopifnot(!anyNA(prediction_data$predicted_probability))
+```
+
+# Plot monthly predicted habitat use
+
+```{r prediction-map, fig.width=14, fig.height=10}
+habitat_areas_plot <- habitat_areas %>%
+  st_transform(crs_projected) %>%
+  st_make_valid()
+
+prediction_map <- ggplot() +
+  geom_raster(
+    data = prediction_data,
+    aes(
+      x = x,
+      y = y,
+      fill = predicted_probability
+    )
+  ) +
+  geom_sf(
+    data = land_crop,
+    fill = "grey80",
+    colour = "grey45",
+    linewidth = 0.2
+  ) +
+  geom_sf(
+    data = habitat_areas_plot,
+    fill = NA,
+    colour = "black",
+    linewidth = 0.6
+  ) +
+  facet_wrap(
+    ~ month_f,
+    ncol = 4,
+    labeller = as_labeller(month_labels)
+  ) +
+  coord_sf(
+    crs = crs_projected,
+    xlim = c(receiver_bbox[["xmin"]], receiver_bbox[["xmax"]]),
+    ylim = c(receiver_bbox[["ymin"]], receiver_bbox[["ymax"]]),
+    expand = FALSE
+  ) +
+  scale_fill_gradientn(
+    colours = c(
+      "#00FFFF",
+      "lightgreen",
+      "#FFFF00",
+      "#FFA500",
+      "#FF00A0"
+    ),
+    limits = c(0, 1),
+    oob = squish,
+    labels = label_number(accuracy = 0.1),
+    name = "Predicted presence\nP(detection ≥ 1)"
+  ) +
+  labs(
+    x = "Easting (m)",
+    y = "Northing (m)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "transparent", colour = NA),
+    plot.background = element_rect(fill = "transparent", colour = NA),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.key.width = grid::unit(3, "cm"),
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 14),
+    legend.background = element_rect(fill = "transparent", colour = NA),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 15)
+  )
+
+prediction_map
+
+ggsave(
+  "gam_monthly_predicted_habitat_use.png",
+  prediction_map,
+  width = 14,
+  height = 10,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  "gam_monthly_predicted_habitat_use.svg",
+  prediction_map,
+  width = 14,
+  height = 10,
+  units = "in",
+  bg = "white"
+)
+```
+
+# Compare predicted habitat use with raw detections
+
+Raw detections are summarized as the number of unique tagged kelts detected at
+each station during each retained calendar month.
+
+```{r raw-detection-map, fig.width=15, fig.height=7.5, fig.cap="Monthly distribution of raw inner Bay of Fundy Atlantic salmon kelt detections. Open circles show locations where tagged kelts were detected, with symbol size corresponding to the number of unique fish detected. Black polygons delineate DFO marine habitat areas 3–8."}
+# Count unique fish detected at each station by calendar month
+raw_detection_counts <- det_analysis %>%
+  filter(
+    month %in% months_keep
+  ) %>%
+  group_by(
+    station,
+    month
+  ) %>%
+  summarise(
+    n_unique_fish = n_distinct(fish),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    receivers,
+    by = "station"
+  ) %>%
+  filter(
+    !is.na(lon),
+    !is.na(lat)
+  ) %>%
+  mutate(
+    month_f = factor(
+      month.name[month],
+      levels = month.name[months_keep]
+    )
+  )
+
+# Convert detection locations to a spatial object
+raw_detection_sf <- raw_detection_counts %>%
+  st_as_sf(
+    coords = c("lon", "lat"),
+    crs = crs_geographic,
+    remove = FALSE
+  )
+
+# Prepare land and habitat polygons in geographic coordinates
+land_raw_plot <- land_crop %>%
+  st_transform(crs_geographic)
+
+habitat_areas_raw_plot <- habitat_areas %>%
+  st_transform(crs_geographic) %>%
+  st_make_valid()
+
+# Define a common map extent from the primary receiver grid
+longitude_limits <- range(
+  receivers$lon,
+  na.rm = TRUE
+) + c(-0.08, 0.08)
+
+latitude_limits <- range(
+  receivers$lat,
+  na.rm = TRUE
+) + c(-0.05, 0.05)
+
+# Select legend breaks supported by the data
+maximum_fish <- max(
+  raw_detection_counts$n_unique_fish,
+  na.rm = TRUE
+)
+
+size_breaks <- c(1, 3, 5, 7, 9)
+
+size_breaks <- size_breaks[
+  size_breaks <= maximum_fish
+]
+
+if (!maximum_fish %in% size_breaks) {
+  size_breaks <- sort(
+    unique(c(size_breaks, maximum_fish))
+  )
+}
+
+# Plot monthly raw detections
+raw_detection_map <- ggplot() +
+  geom_sf(
+    data = land_raw_plot,
+    fill = "grey88",
+    colour = "grey45",
+    linewidth = 0.25
+  ) +
+  geom_sf(
+    data = habitat_areas_raw_plot,
+    fill = NA,
+    colour = "black",
+    linewidth = 0.65
+  ) +
+  geom_sf(
+    data = raw_detection_sf,
+    aes(size = n_unique_fish),
+    shape = 21,
+    fill = "white",
+    colour = "black",
+    stroke = 0.8,
+    alpha = 0.95
+  ) +
+  facet_wrap(
+    ~ month_f,
+    ncol = 4
+  ) +
+  coord_sf(
+    crs = crs_geographic,
+    xlim = longitude_limits,
+    ylim = latitude_limits,
+    expand = FALSE
+  ) +
+  scale_size_continuous(
+    name = "Number of unique\nfish detected",
+    range = c(2, 8),
+    breaks = size_breaks,
+    limits = c(1, maximum_fish)
+  ) +
+  scale_x_continuous(
+    breaks = pretty_breaks(n = 4),
+    labels = label_number(
+      accuracy = 0.1,
+      suffix = "°W",
+      scale = -1
+    )
+  ) +
+  scale_y_continuous(
+    breaks = pretty_breaks(n = 4),
+    labels = label_number(
+      accuracy = 0.1,
+      suffix = "°N"
+    )
+  ) +
+  labs(
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+
+    # Remove the black border around each facet
+    panel.border = element_blank(),
+
+    panel.background = element_rect(
+      fill = "white",
+      colour = NA
+    ),
+    strip.background = element_blank(),
+    strip.text = element_text(
+      size = 16,
+      face = "bold"
+    ),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12),
+    axis.ticks = element_line(colour = "black"),
+    legend.position = "right",
+    legend.title = element_text(
+      size = 14,
+      face = "bold",
+      hjust = 0.5
+    ),
+    legend.text = element_text(size = 12),
+    legend.key.height = grid::unit(0.8, "cm"),
+    legend.key.width = grid::unit(0.8, "cm")
+  ) +
+  guides(
+    size = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      override.aes = list(
+        shape = 21,
+        fill = "white",
+        colour = "black",
+        alpha = 1
+      )
+    )
+  )
+
+raw_detection_map
+
+ggsave(
+  filename = "gam_monthly_raw_detections.png",
+  plot = raw_detection_map,
+  width = 15,
+  height = 7.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  filename = "gam_monthly_raw_detections.svg",
+  plot = raw_detection_map,
+  width = 15,
+  height = 7.5,
+  units = "in",
+  bg = "white"
+)
+```
+
+# Export analysis products
+
+```{r exports}
+write_csv(
+  receiver_month_presence,
+  "gam_receiver_month_presence.csv",
+  na = "NA"
+)
+
+write_csv(
+  prediction_data,
+  "gam_monthly_spatial_predictions.csv",
+  na = "NA"
+)
+
+write_csv(
+  prediction_comparison,
+  "gam_basis_prediction_comparison.csv",
+  na = "NA"
+)
+
+write_csv(
+  model_comparison,
+  "gam_basis_model_comparison.csv",
+  na = "NA"
+)
+
+saveRDS(
+  gam_presence,
+  "gam_presence_model.rds"
+)
+
+capture.output(
+  sessionInfo(),
+  file = "gam_session_info.txt"
+)
+```
