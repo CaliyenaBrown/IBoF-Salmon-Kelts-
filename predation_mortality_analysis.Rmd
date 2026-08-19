@@ -121,26 +121,84 @@ predation_summary <- fish_fates %>%
     n_released = n(),
     n_detected = sum(detected),
     n_predated = sum(predation),
-    proportion_of_released = n_predated / n_released,
-    proportion_of_detected = n_predated / n_detected,
     .groups = "drop"
   ) %>%
   bind_rows(
     fish_fates %>%
       summarise(
-        cohort = factor("All", levels = c("April", "December", "All")),
+        cohort = factor(
+          "All",
+          levels = c("April", "December", "All")
+        ),
         n_released = n(),
         n_detected = sum(detected),
-        n_predated = sum(predation),
-        proportion_of_released = n_predated / n_released,
-        proportion_of_detected = n_predated / n_detected
+        n_predated = sum(predation)
       )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    # Proportion and exact 95% CI among all released kelts
+    proportion_of_released = n_predated / n_released,
+    released_test = list(
+      binom.test(n_predated, n_released)
+    ),
+    released_lower_95_ci = released_test$conf.int[1],
+    released_upper_95_ci = released_test$conf.int[2],
+
+    # Proportion and exact 95% CI among detected kelts
+    proportion_of_detected = n_predated / n_detected,
+    detected_test = list(
+      binom.test(n_predated, n_detected)
+    ),
+    detected_lower_95_ci = detected_test$conf.int[1],
+    detected_upper_95_ci = detected_test$conf.int[2]
+  ) %>%
+  ungroup() %>%
+  select(
+    -released_test,
+    -detected_test
   )
 
-knitr::kable(fate_summary, digits = 3,
-             caption = "Fate classifications by release cohort.")
-knitr::kable(predation_summary, digits = 3,
-             caption = "Inferred predation as a proportion of released and detected kelts.")
+predation_summary_table <- predation_summary %>%
+  mutate(
+    released_estimate = sprintf(
+      "%.1f%% (95%% CI: %.1f–%.1f%%)",
+      proportion_of_released * 100,
+      released_lower_95_ci * 100,
+      released_upper_95_ci * 100
+    ),
+    detected_estimate = sprintf(
+      "%.1f%% (95%% CI: %.1f–%.1f%%)",
+      proportion_of_detected * 100,
+      detected_lower_95_ci * 100,
+      detected_upper_95_ci * 100
+    )
+  ) %>%
+  select(
+    cohort,
+    n_released,
+    n_detected,
+    n_predated,
+    released_estimate,
+    detected_estimate
+  ) %>%
+  rename(
+    Cohort = cohort,
+    `Released kelts` = n_released,
+    `Detected kelts` = n_detected,
+    `Inferred predation events` = n_predated,
+    `Proportion of released kelts` = released_estimate,
+    `Proportion of detected kelts` = detected_estimate
+  )
+
+knitr::kable(
+  predation_summary_table,
+  align = c("l", "r", "r", "r", "l", "l"),
+  caption = paste(
+    "Inferred predation as a proportion of released and detected",
+    "kelts, with exact 95% binomial confidence intervals."
+  )
+)
 ```
 
 # Detection histories and temperature profiles
