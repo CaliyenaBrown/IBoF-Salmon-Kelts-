@@ -503,7 +503,6 @@ monthly_timing_plot <- ggplot(
       fill = month
     ),
     width = 0.75,
-    colour = "black",
     linewidth = 0.3
   ) +
   # Fish-availability line
@@ -528,14 +527,14 @@ monthly_timing_plot <- ggplot(
     guide = "none"
   ) +
   scale_y_continuous(
-    name = "Number of inferred predation events",
+    name = "Number of inferred predation events (Bars)",
     breaks = scales::breaks_width(1),
-    expand = expansion(mult = c(0, 0.08)),
+    expand = expansion(mult = c(0.05, 0.08)),
 
     # Convert the scaled line back to fish counts on the right axis
     sec.axis = sec_axis(
       trans = ~ . * scale_factor,
-      name = "Number of fish available",
+      name = "Number of fish available (Line)",
       breaks = scales::breaks_pretty()
     )
   ) +
@@ -576,6 +575,111 @@ ggsave(
   dpi = 600,
   bg = "white"
 )
+```
+```{r monthly-figure-count-column, fig.width=10, fig.height=7, fig.cap="Monthly timing of inferred predation events in Atlantic salmon kelts. Coloured bars show the number of inferred predation events. The column on the right reports the number of detected kelts available for observation during each month."}
+
+# Prepare data with January at the top
+monthly_count_data <- monthly_summary %>%
+  mutate(
+    month = factor(
+      as.character(month),
+      levels = rev(month.name)
+    )
+  )
+
+# Set the predation-axis range and position of the count column
+predation_max <- max(
+  1,
+  monthly_count_data$n_predation,
+  na.rm = TRUE
+)
+
+availability_column_x <- predation_max + 1.5
+
+monthly_timing_plot_count_column <- ggplot(
+  monthly_count_data,
+  aes(y = month)
+) +
+  # Horizontal predation-event bars
+  geom_col(
+    aes(
+      x = n_predation,
+      fill = month
+    ),
+    orientation = "y",
+    width = 0.65
+  ) +
+  # Fish-availability counts in a separate column
+  geom_text(
+    aes(
+      x = availability_column_x,
+      label = n_available
+    ),
+    size = 4.5,
+    colour = "black"
+  ) +
+  # Heading above the count column
+  annotate(
+    "text",
+    x = availability_column_x,
+    y = Inf,
+    label = "Fish\navailable",
+    vjust = -0.3,
+    size = 4.5,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = month_colours,
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    name = "Number of inferred predation events",
+    breaks = seq(0, predation_max, by = 1),
+    limits = c(0, availability_column_x + 0.5),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_y_discrete(
+    expand = expansion(add = 0.6)
+  ) +
+  coord_cartesian(
+    clip = "off"
+  ) +
+  labs(
+    y = "Month"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.x = element_text(
+      size = 15,
+      margin = margin(t = 10)
+    ),
+    axis.title.y = element_text(
+      size = 16,
+      margin = margin(r = 10)
+    ),
+    axis.text = element_text(size = 13),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(
+      t = 55,
+      r = 20,
+      b = 15,
+      l = 15
+    )
+  )
+
+monthly_timing_plot_count_column
+
+ggsave(
+  filename = "monthly_predation_patterns_count_column.png",
+  plot = monthly_timing_plot_count_column,
+  width = 10,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
 ```
 
 # Reproducibility
