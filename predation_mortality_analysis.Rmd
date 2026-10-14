@@ -22,6 +22,7 @@ library(ggplot2)
 library(patchwork)
 library(survival)
 library(coxphf)
+library(purrr)
 ```
 
 # Purpose
@@ -755,6 +756,113 @@ readr::write_csv(
 )
 ```
 
+Check candidate models and use the penalized log-likelihood from coxphf to 
+calculate the AIC-type criterion explicitly (rather than relying on AIC()).This
+is labelled as AIC* (AIC_star) because it is the heuristic criterion based on 
+the maximum penalized partial likelihood.
+
+```{r}
+# Candidate Cox proportional hazards models
+
+# Four a priori candidate models:
+# 1. Null model
+# 2. TL only
+# 3. Sex only
+# 4. TL + sex
+
+cox_null <- coxphf(
+  Surv(time_days, event) ~ 1,
+  data = cox_data,
+  firth = TRUE
+)
+
+cox_tl <- coxphf(
+  Surv(time_days, event) ~ tl_5cm,
+  data = cox_data,
+  firth = TRUE
+)
+
+cox_sex <- coxphf(
+  Surv(time_days, event) ~ sex,
+  data = cox_data,
+  firth = TRUE
+)
+
+cox_tl_sex <- coxphf(
+  Surv(time_days, event) ~ tl_5cm + sex,
+  data = cox_data,
+  firth = TRUE
+)
+
+# Extract penalized log-likelihood, calculate AICF for Firth-penalized Cox 
+# models, and compare candidate models
+# AICF is calculated using the ordinary Cox partial likelihood
+# evaluated at the Firth-penalized coefficient estimates.
+
+aicf_cox <- function(firth_model, data) {
+  
+  # Refit the corresponding ordinary Cox model using the
+  # Firth estimates as starting values and zero iterations.
+  ordinary_cox <- coxph(
+    formula = formula(firth_model),
+    data = data,
+    init = coef(firth_model),
+    iter.max = 0
+  )
+  
+  # Extract AICF using the procedure described by
+  # Nagashima & Sato (2017)
+  extractAIC(ordinary_cox)[2]
+}
+
+# Calculate it for all 4
+aicf_values <- tibble(
+  Model = c(
+    "Null",
+    "TL",
+    "Sex",
+    "TL + Sex"
+  ),
+  AICF = c(
+    aicf_cox(cox_null, cox_data),
+    aicf_cox(cox_tl, cox_data),
+    aicf_cox(cox_sex, cox_data),
+    aicf_cox(cox_tl_sex, cox_data)
+  )
+) %>%
+  arrange(AICF) %>%
+  mutate(
+    delta_AICF = AICF - min(AICF)
+  )
+
+aicf_values
+```
+
+```{r}
+# Add Akaike weights
+
+aicf_values <- aicf_values %>%
+  mutate(
+    AICF_weight = exp(-0.5 * delta_AICF) /
+      sum(exp(-0.5 * delta_AICF))
+  )
+
+aicf_values
+```
+
+
+```{r}
+# Cohort sensitivity analysis
+# ---------------------------
+
+cox_cohort <- coxphf(
+  Surv(time_days, event) ~ cohort,
+  data = cox_data,
+  firth = TRUE
+)
+
+summary(cox_cohort)
+```
 
 
 # Reproducibility
