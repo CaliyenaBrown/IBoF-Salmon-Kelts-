@@ -1,0 +1,449 @@
+---
+title: "Migration paths of inner Bay of Fundy Atlantic salmon kelts"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_dir: "."
+  output_dir: "migration_outputs"
+date: "2026-10-17"
+---
+
+# Purpose
+
+This standalone workflow visualizes approximate migration paths using finalized
+cleaned detections and actual release dates. It does not require output from
+`bay_exit_analysis.Rmd`. Exit classification and reviewer sensitivity analyses
+are maintained in that separate document.
+
+Required input files are `det_clean_no_release_site_det.rds`,
+`predation_events_clean.rds`, and `meta_clean.rds`, the same cleaned biological
+inputs used for the habitat GAM and exit analysis. Detections must contain
+`fish`, `dt`, `station`, `lon`, and `lat`; metadata require `fish`, `release_dt`;
+finalized predation events require `fish`, `predation_dt`.
+
+Coastline and Stewiacke River layers are drawn behind every movement panel.
+By default, the layers use `rnaturalearthhires::countries10` and `lennox::stewi`,
+as in the original mapping script. Install these packages before knitting, or
+supply local spatial files in the settings below. Layers are cached as RDS
+files in the output folder so subsequent renders can run without these two
+source packages. No packages are installed during knitting. All receivers
+remain eligible; map layers and display limits do not filter the analysis.
+
+```{r setup, include=FALSE}
+required_packages <- c("dplyr", "tidyr", "readr", "lubridate", "ggplot2", "knitr", "sf")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace,
+                                             logical(1), quietly = TRUE)]
+if (length(missing_packages)) stop("Install required packages: ",
+                                   paste(missing_packages, collapse = ", "))
+invisible(lapply(required_packages, library, character.only = TRUE))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                     fig.align = "center", dpi = 300)
+```
+
+```{r settings}
+cohort_levels <- c("April", "December")
+excluded_stations <- c("RELEASESITE", "Stewiacke River Park")
+coastline_file <- "" # Optional local coastline .gpkg, .shp, or .rds
+river_file <- ""     # Optional local Stewiacke River .gpkg, .shp, or .rds
+# Your existing project folder; change this for another computer.
+data_dir <- "/Users/caliyenabrown/Documents/GitHub/IBoF-Salmon-Kelts-"
+output_dir <- file.path(data_dir,"migration_outputs")
+data_path <- function(x) file.path(data_dir,x)
+out_path <- function(x) file.path(output_dir,x)
+dir.create(output_dir,recursive=TRUE,showWarnings=FALSE)
+# Original cohort map extents; these expand automatically to include all locations.
+map_limits <- list(
+  April=list(x=c(-68.6,-63.48),y=c(44,45.69)),
+  December=list(x=c(-67.15,-63.48),y=c(44.1,45.69))
+)
+export_csv <- function(x,name) readr::write_csv(x,out_path(name),na="NA")
+parse_utc <- function(x) {
+  if (inherits(x,"POSIXt")) return(lubridate::with_tz(x,"UTC"))
+  if (inherits(x,"Date")) return(as.POSIXct(x,tz="UTC"))
+  lubridate::parse_date_time(as.character(x),orders=c("ymd HMS","ymd HM","ymd"),
+                             tz="UTC",quiet=TRUE)
+}
+require_cols <- function(x,cols,label) {
+  absent <- setdiff(cols,names(x))
+  if(length(absent)) stop(label," missing: ",paste(absent,collapse=", "))
+}
+```
+
+# Import and validate data
+
+```{r import-data}
+# Check that required files exist
+input_files <- c(
+  "det_clean_no_release_site_det.rds",
+  "meta_clean.rds",
+  "predation_events_clean.rds"
+)
+
+missing_files <- input_files[!file.exists(data_path(input_files))]
+
+if (length(missing_files) > 0L) {
+  stop(
+    "Files missing from ", data_dir, ": ",
+    paste(missing_files, collapse = ", ")
+  )
+}
+
+# Import cleaned data
+det <- base::readRDS(
+  data_path("det_clean_no_release_site_det.rds")
+)
+
+meta_tag <- base::readRDS(
+  data_path("meta_clean.rds")
+)
+
+pred <- base::readRDS(
+  data_path("predation_events_clean.rds")
+)
+
+require_cols(
+  det,
+  c("fish", "dt", "station", "lon", "lat", "temp"),
+  "Detections"
+)
+
+require_cols(
+  meta_tag,
+  c("fish", "release_dt"),
+  "Metadata"
+)
+
+require_cols(
+  pred,
+  c("fish", "predation_dt"),
+  "Finalized predation events"
+)
+
+# Convert tag-level metadata to one release record per fish
+meta <- meta_tag %>%
+  transmute(
+    fish = as.character(as.integer(as.character(fish))),
+    release_dt = parse_utc(release_dt)
+  ) %>%
+  distinct(fish, release_dt)
+
+stopifnot(
+  !anyNA(meta$fish),
+  !anyNA(meta$release_dt),
+  !anyDuplicated(meta$fish)
+)
+
+meta <- meta %>%
+  mutate(
+    cohort = factor(
+      case_when(
+        lubridate::month(release_dt) == 4 ~ "April",
+        lubridate::month(release_dt) == 12 ~ "December",
+        TRUE ~ NA_character_
+      ),
+      levels = cohort_levels
+    )
+  )
+
+stopifnot(!anyNA(meta$cohort))
+
+# Prepare detections from all receivers
+if (!"receiver" %in% names(det)) {
+  det$receiver <- NA_character_
+}
+
+det <- det %>%
+  transmute(
+    fish = as.character(as.integer(as.character(fish))),
+    dt = parse_utc(dt),
+    station = as.character(station),
+    lon = as.numeric(as.character(lon)),
+    lat = as.numeric(as.character(lat)),
+    temp = as.numeric(as.character(temp)),
+    receiver = as.character(receiver)
+  )
+
+# Record exclusions before filtering
+import_audit <- tibble::tibble(
+  n_input = nrow(det),
+  n_missing_fish = sum(is.na(det$fish)),
+  n_missing_time = sum(is.na(det$dt)),
+  n_identified_outside_metadata = sum(
+    !is.na(det$fish) & !det$fish %in% meta$fish
+  )
+)
+
+export_csv(
+  import_audit,
+  "detection_import_audit.csv"
+)
+
+# Apply the same inclusion criteria as the predation analysis
+det <- det %>%
+  filter(
+    !is.na(fish),
+    !is.na(dt),
+    fish %in% meta$fish
+  ) %>%
+  arrange(fish, dt)
+
+detected_fish <- intersect(meta$fish, unique(det$fish))
+
+stopifnot(length(detected_fish) > 0L)
+
+analysis_meta <- meta %>%
+  filter(fish %in% detected_fish)
+
+export_csv(
+  analysis_meta,
+  "detected_fish_population.csv"
+)
+
+# Prepare finalized predation events
+pred <- pred %>%
+  transmute(
+    fish = as.character(as.integer(as.character(fish))),
+    predation_dt = parse_utc(predation_dt)
+  )
+
+stopifnot(
+  !anyNA(pred),
+  !anyDuplicated(pred$fish),
+  all(pred$fish %in% meta$fish)
+)
+
+# Check consistency with the predation analysis:
+# first temperature >20°C, excluding Fish 72
+expected_pred <- det %>%
+  filter(
+    !is.na(temp),
+    temp > 20,
+    fish != "72"
+  ) %>%
+  group_by(fish) %>%
+  summarise(
+    predation_dt = min(dt),
+    .groups = "drop"
+  )
+
+predation_mismatch <- full_join(
+  expected_pred %>%
+    rename(expected_dt = predation_dt),
+  pred %>%
+    rename(finalized_dt = predation_dt),
+  by = "fish"
+) %>%
+  filter(
+    is.na(expected_dt) |
+      is.na(finalized_dt) |
+      expected_dt != finalized_dt
+  )
+
+export_csv(
+  predation_mismatch,
+  "predation_event_consistency_check.csv"
+)
+
+if (nrow(predation_mismatch) > 0L) {
+  stop(
+    "Finalized predation events differ from the current detections. ",
+    "Review predation_event_consistency_check.csv before continuing."
+  )
+}
+
+# Attach release dates, cohorts, and predation times
+# Retain all receiver stations, including those with missing coordinates
+det <- det %>%
+  left_join(meta, by = "fish") %>%
+  left_join(pred, by = "fish") %>%
+  arrange(fish, dt, station, receiver)
+
+if (any(det$dt < det$release_dt)) {
+  stop("Detections precede release; review timestamps.")
+}
+
+# Summarize the detected-fish population before predation truncation
+population_summary <- meta %>%
+  mutate(
+    detected = fish %in% detected_fish
+  ) %>%
+  group_by(cohort) %>%
+  summarise(
+    n_released = n(),
+    n_detected = sum(detected),
+    n_undetected = sum(!detected),
+    .groups = "drop"
+  )
+
+knitr::kable(population_summary)
+
+export_csv(
+  population_summary,
+  "analysis_population.csv"
+)
+```
+
+# Retain pre-predation movements
+
+The first inferred predation observation and all later records are removed.
+This is stricter than retaining the event record for a temperature figure;
+post-ingestion observations must not be interpreted as live kelt movements.
+All non-release stations, including supplementary river and marine stations,
+are retained for movement visualization.
+
+```{r prepare-movements}
+live_all <- det %>% filter(is.na(predation_dt) | dt < predation_dt)
+coordinate_audit <- live_all %>% summarise(
+  n_records=n(),n_missing_coordinates=sum(!is.finite(lon) | !is.finite(lat)))
+knitr::kable(coordinate_audit)
+export_csv(coordinate_audit,"movement_coordinate_audit.csv")
+if(!nrow(live_all)) stop("No pre-predation detections available.")
+movement_population_audit <- analysis_meta %>%
+  left_join(live_all %>% group_by(fish) %>% summarise(
+    n_pre_predation=n(),n_located_pre_predation=sum(is.finite(lon)&is.finite(lat)),
+    .groups="drop"),by="fish") %>%
+  mutate(n_pre_predation=replace_na(n_pre_predation,0L),
+         n_located_pre_predation=replace_na(n_located_pre_predation,0L))
+export_csv(movement_population_audit,"movement_population_audit.csv")
+knitr::kable(movement_population_audit)
+
+```
+
+# Study site background layers
+
+Local files take priority, followed by cached layers from a previous run and
+then the installed source packages. All layers are transformed to WGS84 before
+plotting. Missing layers produce a clear message rather than silently omitting
+the study-site background. Delete the relevant cache to refresh a package layer.
+
+```{r background-layers}
+read_spatial <- function(filename) {
+  if(!file.exists(filename)) stop("Spatial file not found: ",filename)
+  layer <- if(tolower(tools::file_ext(filename))=="rds") {
+    base::readRDS(filename)
+  } else sf::st_read(filename,quiet=TRUE)
+  if(!inherits(layer,c("sf","sfc"))) stop("Expected an sf spatial layer: ",filename)
+  if(is.na(sf::st_crs(layer))) stop("Spatial layer has no coordinate reference system: ",filename)
+  sf::st_transform(sf::st_make_valid(layer),4326)
+}
+land_cache <- out_path("study_site_land.rds")
+river_cache <- out_path("study_site_stewiacke.rds")
+if(nzchar(coastline_file)) {
+  atl <- read_spatial(data_path(coastline_file))
+} else if(file.exists(land_cache)) {
+  atl <- read_spatial(land_cache)
+} else {
+  if(!requireNamespace("rnaturalearthhires",quietly=TRUE)) stop(
+    "Install rnaturalearthhires before knitting, or set coastline_file to a local spatial file.")
+  atl <- rnaturalearthhires::countries10
+  country_column <- intersect(c("NAME_EN","ADMIN","admin","name"),names(atl))[1]
+  if(is.na(country_column)) stop("Cannot find country-name column in coastline data.")
+  atl <- atl %>% filter(grepl("Canada|United States",.data[[country_column]]))
+  atl <- sf::st_transform(sf::st_make_valid(atl),4326)
+}
+if(nzchar(river_file)) {
+  stewi <- read_spatial(data_path(river_file))
+} else if(file.exists(river_cache)) {
+  stewi <- read_spatial(river_cache)
+} else {
+  if(!requireNamespace("lennox",quietly=TRUE)) stop(
+    "Install the lennox package before knitting, or set river_file to a local Stewiacke River spatial file.")
+  stewi <- lennox::stewi
+  if(is.na(sf::st_crs(stewi))) stop("Stewiacke River layer has no coordinate reference system.")
+  stewi <- sf::st_transform(sf::st_make_valid(stewi),4326)
+}
+# Cache the layers actually used, without altering biological data.
+saveRDS(atl,land_cache)
+saveRDS(stewi,river_cache)
+```
+
+# Approximate movement paths
+
+Panels show all located pre-predation observations. Colours represent elapsed
+time from the actual release date for both cohorts. Grey land and the blue
+Stewiacke River are repeated behind each panel. Crosses identify the final
+located pre-predation observation, which need not be the fish's final observation
+if later records lack coordinates. Lines connect receiver locations, not known
+continuous travel routes. Simultaneous observations at distinct locations are
+not connected in an arbitrary order. No receiver-grid restriction is applied.
+
+```{r movement-paths, fig.width=14, fig.height=14}
+paths <- live_all %>% filter(is.finite(lon),is.finite(lat)) %>%
+  distinct(fish,dt,station,lon,lat,release_dt,cohort) %>%
+  mutate(days_since_release=as.numeric(difftime(dt,release_dt,units="days"))) %>%
+  group_by(fish,dt) %>% mutate(n_locations_at_time=n_distinct(paste(lon,lat))) %>% ungroup() %>%
+  arrange(fish,dt,station)
+paths <- paths %>% group_by(fish) %>% mutate(
+  segment=cumsum(n_locations_at_time>1 | lag(n_locations_at_time>1,default=FALSE))) %>% ungroup()
+export_csv(paths,"pre_predation_movement_locations.csv")
+map_extent_audit <- list()
+for(cc in cohort_levels) {
+  x <- paths %>% filter(cohort==cc)
+  if(!nrow(x)) next
+  # Numeric facet ordering: Fish 1, 2, 3, ... rather than 1, 10, 11, ...
+  fish_levels <- as.character(sort(unique(as.integer(x$fish))))
+  x <- x %>% mutate(fish=factor(fish,levels=fish_levels))
+  last_points <- x %>% group_by(fish) %>% filter(dt==max(dt)) %>% ungroup()
+  xlim <- range(c(map_limits[[cc]]$x,x$lon-0.03,x$lon+0.03))
+  ylim <- range(c(map_limits[[cc]]$y,x$lat-0.03,x$lat+0.03))
+  map_extent_audit[[cc]] <- tibble::tibble(cohort=cc,xmin=xlim[1],xmax=xlim[2],
+                                          ymin=ylim[1],ymax=ylim[2])
+  bbox <- sf::st_bbox(c(xmin=xlim[1],xmax=xlim[2],ymin=ylim[1],ymax=ylim[2]),
+                       crs=sf::st_crs(4326))
+  land_plot <- suppressWarnings(sf::st_crop(atl,bbox))
+  river_plot <- suppressWarnings(sf::st_crop(stewi,bbox))
+  # Background layers come first so land never hides movement observations.
+  p <- ggplot() +
+    geom_sf(data=land_plot,fill="lightgray",colour="darkgray",linewidth=0.2) +
+    geom_sf(data=river_plot,colour="dodgerblue3",linewidth=0.45) +
+    geom_path(data=x %>% filter(n_locations_at_time==1),
+      aes(lon,lat,group=interaction(fish,segment),colour=days_since_release),
+      linewidth=0.5,alpha=0.8) +
+    geom_point(data=x,aes(lon,lat,colour=days_since_release),size=0.7,alpha=0.6) +
+    geom_point(data=last_points,aes(lon,lat),shape=4,size=2.5,stroke=1,
+               colour="darkblue") +
+    facet_wrap(~fish,ncol=4) +
+    coord_sf(crs=sf::st_crs(4326),default_crs=sf::st_crs(4326),
+             xlim=xlim,ylim=ylim,datum=NA,expand=FALSE) +
+    scale_colour_viridis_c(option="rocket",name="Days since release") +
+    labs(title=paste(cc,"release"),x=NULL,y=NULL) +
+    theme_minimal(base_size=12) +
+    theme(panel.grid=element_blank(),axis.text=element_blank(),axis.ticks=element_blank(),
+      legend.position="bottom",legend.key.width=grid::unit(3,"cm"),
+      strip.text=element_text(face="bold",size=12),
+      plot.title=element_text(face="bold",hjust=0.5),
+      plot.background=element_rect(fill="white",colour=NA))
+  print(p)
+  if(cc=="April") april_map <- p else december_map <- p
+  map_height <- max(5,ceiling(n_distinct(x$fish)/4)*2.5)
+  ggsave(out_path(paste0(tolower(cc),"_movement_paths.png")),p,
+         width=14,height=map_height,dpi=300,limitsize=FALSE,bg="white")
+  ggsave(out_path(paste0(tolower(cc),"_movement_paths.pdf")),p,
+         width=14,height=map_height,limitsize=FALSE,bg="white")
+}
+export_csv(dplyr::bind_rows(map_extent_audit),"movement_map_extents.csv")
+```
+
+# Detection durations and reproducibility
+
+Durations below describe observation windows, not confirmed continuous
+residence or survival. All detected fish are listed in the population table. A fish without a located
+pre-predation detection has no drawable movement path and is listed in the audit.
+
+```{r summaries}
+movement_summary <- live_all %>% group_by(fish,cohort,release_dt) %>% summarise(
+  first_detection=min(dt),last_detection=max(dt),n_records=n(),
+  n_stations=n_distinct(station),n_days_detected=n_distinct(as.Date(dt)),
+  days_release_to_last=as.numeric(difftime(max(dt),first(release_dt),units="days")),
+  .groups="drop")
+knitr::kable(movement_summary,digits=2)
+export_csv(movement_summary,"individual_detection_durations.csv")
+inputs <- c("det_clean_no_release_site_det.rds","predation_events_clean.rds","meta_clean.rds")
+if(nzchar(coastline_file)) inputs <- c(inputs,coastline_file)
+if(nzchar(river_file)) inputs <- c(inputs,river_file)
+export_csv(tibble(file=inputs,md5=unname(tools::md5sum(data_path(inputs)))),"input_checksums.csv")
+capture.output(sessionInfo(),file=out_path("migration_session_info.txt"))
+```
