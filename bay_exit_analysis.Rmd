@@ -1,0 +1,1110 @@
+---
+title: "First exit of Atlantic salmon kelts from the Bay of Fundy"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_dir: "."
+  output_dir: "exit_outputs"
+date: "2026-10-17"
+---
+
+# Purpose and interpretation
+
+This reproducible analysis describes first observed Bay of Fundy (BoF) exit,
+compares release cohorts, and evaluates uncertainty in exit classification for
+kelts with a final pre-predation detection at an exit gate. It uses the same
+cleaned detection, metadata, and finalized predation-event files as the habitat
+GAM. It does not re-identify predation from a temperature threshold.
+
+Three scenarios are evaluated with an identical analysis population:
+
+1. **Primary:** confirmed exits plus final-gate assumed exits without subsequent
+   inferred predation. Predated fish retain any earlier confirmed exit.
+2. **Inclusive:** primary exits plus final-gate assumed exits among predated
+   kelts without an earlier confirmed exit. This is the reviewer-requested
+   alternative classification, not proof that those fish crossed the boundary.
+3. **Confirmed only:** only detections outside the BoF establish an exit.
+
+Kaplan–Meier (KM) estimates censor predation and other losses to observation.
+They are conditional time-to-exit summaries, not estimates of the actual
+probability of exiting before death or of continuous residence inside the Bay.
+Log-rank tests are exploratory: release cohort is confounded with season, year,
+condition, and time since release. No automatic conclusion is based solely on
+whether a p-value crosses 0.05.
+
+# Requirements and configuration
+
+Place this file beside:
+
+- `det_clean_no_release_site_det.rds`: `fish`, `dt`, `station`, `lon`, `lat`;
+  optional `temp` and `receiver` are retained for audit.
+- `predation_events_clean.rds`: one finalized event per fish, with `fish` and
+  `predation_dt` (including the previously reviewed exclusion for Fish 72).
+- `meta_clean.rds`: tag-level metadata with `fish`, `release_dt`; repeated fish/release records are collapsed.
+- `recs_meta.rds`: full receiver metadata with `station`, `lon`, `lat`, `t`.
+
+**Receiver input:** use the full `recs_meta.rds` produced by `Receiver_map.R`,
+including its `t` receiver-type column. The import also accepts a CSV when
+`receiver_file` is changed accordingly. No separate gate file is needed.
+
+The exit gate is selected using the rule in `Receiver_map.R`:
+` t == "gate" & lat < 44.83854 & lon > -66.91027 & lon < -66 `.
+The selected stations and a gate-highlight map are exported for verification.
+Explicit gate-station overrides remain available only when typed metadata are
+unavailable. This document contains exit analyses; `migration_paths.Rmd` is the
+standalone movement-figure workflow and does not need to be run first.
+
+The original script's outside-Bay rule is deliberately retained for comparability:
+longitude west of the westernmost gate receiver **and** latitude south of a fitted
+gate line. This is a heuristic, not a full geographic BoF boundary, and can miss
+exits elsewhere. A reviewed optional `outside_station_classification.csv` with
+`station` and logical `outside_bay` overrides it for listed stations. Supply all
+outside stations in that file when adopting a revised boundary definition.
+
+The analysis population matches the predation analysis: all fish with a valid
+post-release detection in the supplied cleaned file and an ID in the released
+metadata, before predation truncation. All Minas Basin, BoF, and supplementary
+receiver detections are retained. Receiver metadata define gates and recover
+coordinates; they do not define fish inclusion. Missing locations cannot establish
+an exit but are retained in the observation history. A fish detected only at or
+after inferred predation remains in the denominator, is censored at inferred
+predation, and has no live movement path. Such cases are exported for review.
+Only the GAM uses a primary-grid restriction.
+
+```{r setup, include=FALSE}
+required_packages <- c("dplyr", "tidyr", "readr", "lubridate", "ggplot2",
+                       "survival", "survminer", "knitr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace,
+                                             logical(1), quietly = TRUE)]
+if (length(missing_packages)) stop("Install required packages: ",
+                                   paste(missing_packages, collapse = ", "))
+invisible(lapply(required_packages, library, character.only = TRUE))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                     fig.align = "center", dpi = 300)
+```
+
+```{r settings}
+receiver_file <- "recs_meta.rds" # Full typed receiver metadata
+raw_receiver_file <- "RECEIVER DEPLOYMENT 2024-25[69].csv"
+gate_file <- "exit_gate_receivers.csv"
+gate_station_ids <- character(0) # Verified station names, if no separate gate CSV
+outside_station_file <- "outside_station_classification.csv"
+excluded_stations <- c("RELEASESITE", "Stewiacke River Park")
+audit_window_hours <- 72 # Display only; full sequences are also exported
+cohort_levels <- c("April", "December")
+scenario_levels <- c("Primary", "Inclusive", "Confirmed only")
+plot_colours <- c(April = "#56B4E9", December = "#003B73")
+data_path <- function(x) file.path(params$data_dir, x)
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+out_path <- function(x) file.path(params$output_dir, x)
+export_csv <- function(x, name) readr::write_csv(x, out_path(name), na = "NA")
+na_time <- as.POSIXct(NA, tz = "UTC")
+parse_utc <- function(x) {
+  if (inherits(x, "POSIXt")) return(lubridate::with_tz(x, "UTC"))
+  if (inherits(x, "Date")) return(as.POSIXct(x, tz = "UTC"))
+  lubridate::parse_date_time(as.character(x), orders = c("ymd HMS", "ymd HM", "ymd"),
+                             tz = "UTC", quiet = TRUE)
+}
+require_cols <- function(x, cols, label) {
+  absent <- setdiff(cols, names(x))
+  if (length(absent)) stop(label, " missing columns: ", paste(absent, collapse = ", "))
+}
+parse_flag <- function(x) {
+  z <- tolower(trimws(as.character(x)))
+  if (any(!is.na(z) & !z %in% c("true", "false", "1", "0")))
+    stop("Logical classification must use TRUE/FALSE or 1/0.")
+  ifelse(is.na(z), NA, z %in% c("true", "1"))
+}
+first_time <- function(x) if (length(x) && any(!is.na(x))) min(x, na.rm=TRUE) else na_time
+last_time <- function(x) if (length(x) && any(!is.na(x))) max(x, na.rm=TRUE) else na_time
+```
+
+# Import and validate finalized data
+
+No fish IDs, predation counts, exit counts, or historical percentages are hard-coded.
+Fish identifiers are converted through character strings to avoid factor-code errors.
+Release dates always come from biological metadata, not the first detection.
+
+```{r import-data}
+# Define paths directly without modifying params
+data_dir <- "/Users/caliyenabrown/Documents/GitHub/IBoF-Salmon-Kelts-"
+output_dir <- file.path(data_dir, "exit_outputs")
+receiver_file <- "recs_meta.rds"
+
+data_path <- function(x) file.path(data_dir, x)
+out_path <- function(x) file.path(output_dir, x)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+export_csv <- function(x, name) {
+  readr::write_csv(x, out_path(name), na = "NA")
+}
+
+# Check required files
+input_files <- c(
+  "det_clean_no_release_site_det.rds",
+  "meta_clean.rds",
+  "predation_events_clean.rds",
+  receiver_file
+)
+
+missing_files <- input_files[
+  !file.exists(data_path(input_files))
+]
+
+if (length(missing_files) > 0L) {
+  stop(
+    "Files missing from ", data_dir, ": ",
+    paste(missing_files, collapse = ", ")
+  )
+}
+
+# Import cleaned data
+det <- base::readRDS(
+  data_path("det_clean_no_release_site_det.rds")
+)
+
+meta_tag <- base::readRDS(
+  data_path("meta_clean.rds")
+)
+
+pred <- base::readRDS(
+  data_path("predation_events_clean.rds")
+)
+
+require_cols(
+  det,
+  c("fish", "dt", "station", "lon", "lat", "temp"),
+  "Detections"
+)
+
+require_cols(
+  meta_tag,
+  c("fish", "release_dt"),
+  "Metadata"
+)
+
+require_cols(
+  pred,
+  c("fish", "predation_dt"),
+  "Finalized predation events"
+)
+
+# Collapse tag-level metadata to one release record per fish
+meta <- meta_tag %>%
+  transmute(
+    fish = as.character(as.integer(as.character(fish))),
+    release_dt = parse_utc(release_dt)
+  ) %>%
+  distinct(fish, release_dt)
+
+stopifnot(
+  !anyNA(meta$fish),
+  !anyNA(meta$release_dt),
+  !anyDuplicated(meta$fish)
+)
+
+# Assign cohorts from actual release dates
+meta <- meta %>%
+  mutate(
+    cohort = factor(
+      case_when(
+        lubridate::month(release_dt) == 4 ~ "April",
+        lubridate::month(release_dt) == 12 ~ "December",
+        TRUE ~ NA_character_
+      ),
+      levels = cohort_levels
+    )
+  )
+
+stopifnot(!anyNA(meta$cohort))
+
+# Prepare detections from all receivers
+if (!"receiver" %in% names(det)) {
+  det$receiver <- NA_character_
+}
+
+det <- det %>%
+  transmute(
+    fish = as.character(as.integer(as.character(fish))),
+    dt = parse_utc(dt),
+    station = as.character(station),
+    lon = as.numeric(as.character(lon)),
+    lat = as.numeric(as.character(lat)),
+    temp = as.numeric(as.character(temp)),
+    receiver = as.character(receiver)
+  )
+
+# Record exclusions before filtering
+import_audit <- tibble::tibble(
+  n_input = nrow(det),
+  n_missing_fish = sum(is.na(det$fish)),
+  n_missing_time = sum(is.na(det$dt)),
+  n_identified_outside_metadata = sum(
+    !is.na(det$fish) & !det$fish %in% meta$fish
+  )
+)
+
+export_csv(
+  import_audit,
+  "detection_import_audit.csv"
+)
+
+# Match the predation-analysis population before predation truncation
+det <- det %>%
+  filter(
+    !is.na(fish),
+    !is.na(dt),
+    fish %in% meta$fish
+  ) %>%
+  arrange(fish, dt)
+
+detected_fish <- intersect(meta$fish, unique(det$fish))
+
+stopifnot(length(detected_fish) > 0L)
+
+analysis_meta <- meta %>%
+  filter(fish %in% detected_fish)
+
+export_csv(
+  analysis_meta,
+  "detected_fish_population.csv"
+)
+
+# Prepare finalized predation events
+pred <- pred %>%
+  transmute(
+    fish = as.character(as.integer(as.character(fish))),
+    predation_dt = parse_utc(predation_dt)
+  )
+
+stopifnot(
+  !anyNA(pred),
+  !anyDuplicated(pred$fish),
+  all(pred$fish %in% meta$fish)
+)
+
+# Validate against the predation-analysis rule:
+# first temperature >20°C, excluding Fish 72
+expected_pred <- det %>%
+  filter(
+    !is.na(temp),
+    temp > 20,
+    fish != "72"
+  ) %>%
+  group_by(fish) %>%
+  summarise(
+    predation_dt = min(dt),
+    .groups = "drop"
+  )
+
+predation_mismatch <- full_join(
+  expected_pred %>%
+    rename(expected_dt = predation_dt),
+  pred %>%
+    rename(finalized_dt = predation_dt),
+  by = "fish"
+) %>%
+  filter(
+    is.na(expected_dt) |
+      is.na(finalized_dt) |
+      expected_dt != finalized_dt
+  )
+
+export_csv(
+  predation_mismatch,
+  "predation_event_consistency_check.csv"
+)
+
+if (nrow(predation_mismatch) > 0L) {
+  stop(
+    "Finalized predation events differ from the current detections. ",
+    "Review predation_event_consistency_check.csv before continuing."
+  )
+}
+
+# Attach metadata without restricting receiver stations
+det <- det %>%
+  left_join(meta, by = "fish") %>%
+  left_join(pred, by = "fish") %>%
+  arrange(fish, dt, station, receiver)
+
+if (any(det$dt < det$release_dt)) {
+  stop("Detections precede release; review timestamps.")
+}
+
+# Summarize the detected-fish population
+population_summary <- meta %>%
+  mutate(
+    detected = fish %in% detected_fish
+  ) %>%
+  group_by(cohort) %>%
+  summarise(
+    n_released = n(),
+    n_detected = sum(detected),
+    n_undetected = sum(!detected),
+    .groups = "drop"
+  )
+
+knitr::kable(population_summary)
+
+export_csv(
+  population_summary,
+  "analysis_population.csv"
+)
+
+# Standardize receiver metadata column names
+normalize_receivers <- function(x) {
+  rename_map <- c(
+    STATION = "station",
+    `DEPLOY LON DD` = "lon",
+    `DEPLOY LAT DD` = "lat",
+    TYPE = "t"
+  )
+
+  for (old in names(rename_map)) {
+    new <- unname(rename_map[[old]])
+
+    if (old %in% names(x) && !new %in% names(x)) {
+      names(x)[names(x) == old] <- new
+    }
+  }
+
+  x
+}
+
+# Receiver metadata define gates and recover coordinates;
+# they do not restrict detection or fish inclusion
+recs <- base::readRDS(
+  data_path(receiver_file)
+)
+
+recs <- normalize_receivers(recs)
+
+require_cols(
+  recs,
+  c("station", "lon", "lat", "t"),
+  "Full receiver metadata"
+)
+
+recs <- recs %>%
+  mutate(
+    station = as.character(station),
+    lon = as.numeric(as.character(lon)),
+    lat = as.numeric(as.character(lat)),
+    t = tolower(trimws(as.character(t)))
+  )
+
+station_coords <- recs %>%
+  filter(
+    !is.na(station),
+    is.finite(lon),
+    is.finite(lat)
+  ) %>%
+  distinct(station, lon, lat)
+
+if (anyDuplicated(station_coords$station)) {
+  stop("Receiver metadata contain conflicting station coordinates.")
+}
+
+if (!any(recs$t == "gate", na.rm = TRUE)) {
+  stop("No gate labels found in full receiver metadata.")
+}
+```
+
+# Define and inspect the boundary
+
+```{r gate-definition}
+det <- det %>%
+  select(-any_of(c(
+    "exit_gate", "outside_heuristic", "outside_override",
+    "outside_bay", "marine", "location_class"
+  )))
+
+# Define exit-gate receivers
+if ("t" %in% names(recs)) {
+
+  recs <- recs %>%
+    mutate(
+      exit_gate = coalesce(
+        t == "gate" &
+          lat < 44.83854 &
+          lon > -66.91027 &
+          lon < -66,
+        FALSE
+      )
+    )
+
+  gates <- recs %>%
+    filter(exit_gate)
+
+} else if (file.exists(data_path(gate_file))) {
+
+  gates <- readr::read_csv(
+    data_path(gate_file),
+    show_col_types = FALSE
+  )
+
+  require_cols(
+    gates,
+    c("station", "lon", "lat"),
+    "Gate table"
+  )
+
+} else if (length(gate_station_ids)) {
+
+  if (!all(gate_station_ids %in% recs$station)) {
+    stop("Configured gate stations are absent from receiver metadata.")
+  }
+
+  gates <- recs %>%
+    filter(station %in% gate_station_ids)
+
+} else if ("exit_gate" %in% names(recs)) {
+
+  gates <- recs %>%
+    filter(parse_flag(exit_gate) %in% TRUE)
+
+} else {
+  stop("Receiver metadata must include gate labels or verified gate stations.")
+}
+
+gates <- gates %>%
+  transmute(
+    station = as.character(station),
+    lon = as.numeric(as.character(lon)),
+    lat = as.numeric(as.character(lat))
+  ) %>%
+  distinct()
+
+stopifnot(
+  nrow(gates) >= 2L,
+  !anyNA(gates),
+  !anyDuplicated(gates$station),
+  n_distinct(gates$lon) >= 2L
+)
+
+# Fit the original gate-line boundary
+gate_model <- lm(lat ~ lon, data = gates)
+
+gate_intercept <- unname(coef(gate_model)[1])
+gate_slope <- unname(coef(gate_model)[2])
+min_gate_lon <- min(gates$lon)
+
+export_csv(gates, "exit_gate_stations.csv")
+
+# Receiver coordinates available for filling missing detection locations
+receiver_coordinates <- recs %>%
+  transmute(
+    station = as.character(station),
+    receiver_lon = as.numeric(as.character(lon)),
+    receiver_lat = as.numeric(as.character(lat))
+  ) %>%
+  filter(
+    !is.na(station),
+    is.finite(receiver_lon),
+    is.finite(receiver_lat)
+  ) %>%
+  distinct()
+
+if (anyDuplicated(receiver_coordinates$station)) {
+  stop("Receiver metadata contain conflicting coordinates for a station.")
+}
+
+# Additional coordinates from stations with one unique observed location
+observed_coordinates <- det %>%
+  filter(
+    !is.na(station),
+    !station %in% c("", "NA"),
+    is.finite(lon),
+    is.finite(lat)
+  ) %>%
+  distinct(station, lon, lat) %>%
+  group_by(station) %>%
+  filter(n() == 1L) %>%
+  ungroup() %>%
+  rename(
+    observed_lon = lon,
+    observed_lat = lat
+  )
+
+# Replace incomplete coordinate pairs, keeping the source pair together
+det <- det %>%
+  left_join(receiver_coordinates, by = "station") %>%
+  left_join(observed_coordinates, by = "station") %>%
+  mutate(
+    coordinate_source = case_when(
+      is.finite(lon) & is.finite(lat) ~ "Detection",
+      is.finite(receiver_lon) & is.finite(receiver_lat) ~
+        "Receiver metadata",
+      is.finite(observed_lon) & is.finite(observed_lat) ~
+        "Other detections at station",
+      TRUE ~ "Unresolved"
+    ),
+    filled_lon = case_when(
+      coordinate_source == "Detection" ~ lon,
+      coordinate_source == "Receiver metadata" ~ receiver_lon,
+      coordinate_source == "Other detections at station" ~ observed_lon,
+      TRUE ~ NA_real_
+    ),
+    filled_lat = case_when(
+      coordinate_source == "Detection" ~ lat,
+      coordinate_source == "Receiver metadata" ~ receiver_lat,
+      coordinate_source == "Other detections at station" ~ observed_lat,
+      TRUE ~ NA_real_
+    ),
+    lon = filled_lon,
+    lat = filled_lat
+  ) %>%
+  select(-any_of(c(
+    "receiver_lon", "receiver_lat",
+    "observed_lon", "observed_lat",
+    "filled_lon", "filled_lat"
+  )))
+
+# Identify gate detections and apply the original outside-Bay rule
+det <- det %>%
+  mutate(
+    exit_gate = station %in% gates$station,
+    outside_heuristic = lon < min_gate_lon &
+      lat < gate_intercept + gate_slope * lon
+  )
+
+# Apply optional reviewed station classifications
+if (file.exists(data_path(outside_station_file))) {
+
+  outside_lookup <- readr::read_csv(
+    data_path(outside_station_file),
+    show_col_types = FALSE
+  )
+
+  require_cols(
+    outside_lookup,
+    c("station", "outside_bay"),
+    "Outside station table"
+  )
+
+  outside_lookup <- outside_lookup %>%
+    transmute(
+      station = as.character(station),
+      outside_override = parse_flag(outside_bay)
+    )
+
+  stopifnot(
+    !anyDuplicated(outside_lookup$station),
+    !anyNA(outside_lookup)
+  )
+
+  det <- det %>%
+    left_join(outside_lookup, by = "station")
+
+} else {
+  det$outside_override <- NA
+}
+
+# Preserve unresolved locations without assigning them to inside or outside
+det <- det %>%
+  mutate(
+    outside_bay = case_when(
+      exit_gate ~ FALSE,
+      TRUE ~ coalesce(outside_override, outside_heuristic)
+    ),
+    marine = exit_gate |
+      station %in% recs$station |
+      coalesce(outside_bay, FALSE),
+    location_class = case_when(
+      exit_gate ~ "Gate",
+      outside_bay %in% TRUE ~ "Outside",
+      is.na(outside_bay) ~ "Unknown location",
+      TRUE ~ "Inside boundary"
+    )
+  )
+
+# Export unresolved records for review
+unresolved_locations <- det %>%
+  filter(location_class == "Unknown location")
+
+export_csv(
+  unresolved_locations,
+  "unresolved_detection_locations.csv"
+)
+
+if (nrow(unresolved_locations) > 0L) {
+  warning(
+    nrow(unresolved_locations),
+    " detections have unresolved locations. ",
+    "They are retained but cannot establish an exit or an inside-Bay return. ",
+    "See unresolved_detection_locations.csv."
+  )
+}
+station_audit <- det %>% count(station,lon,lat,location_class,marine,name="n_records")
+export_csv(station_audit,"station_classification_audit.csv")
+knitr::kable(station_audit)
+```
+
+```{r receiver-gate-map, fig.width=10, fig.height=6}
+receiver_gate_map <- station_coords %>%
+  mutate(exit_gate=station %in% gates$station) %>%
+  ggplot(aes(lon,lat)) +
+  geom_point(aes(fill=exit_gate),shape=21,colour="black",size=2) +
+  scale_fill_manual(values=c(`FALSE`="grey65",`TRUE`="red"),
+                    labels=c(`FALSE`="Other marine receivers",`TRUE`="Exit gate"),
+                    name="Receiver group") +
+  geom_abline(intercept=gate_intercept,slope=gate_slope,linetype="dashed") +
+  coord_quickmap() + theme_bw() + labs(x="Longitude",y="Latitude")
+receiver_gate_map
+ggsave(out_path("receiver_exit_gate_map.png"),receiver_gate_map,width=10,height=6,dpi=300)
+```
+
+```{r boundary-map, fig.width=9, fig.height=6}
+boundary_plot <- ggplot(station_audit, aes(lon, lat, colour=location_class)) +
+  geom_point(na.rm=TRUE) + geom_point(data=gates, aes(lon, lat), inherit.aes=FALSE,
+                            shape=4, size=3, colour="black") +
+  geom_abline(intercept=gate_intercept, slope=gate_slope, linetype="dashed") +
+  coord_quickmap() + theme_bw() + labs(x="Longitude", y="Latitude", colour="Classification")
+boundary_plot
+ggsave(out_path("boundary_classification.png"), boundary_plot, width=9, height=6, dpi=300)
+```
+
+# Build pre-predation histories
+
+The inferred predation record itself is excluded from live movement histories.
+Simultaneous detections at different stations are retained and flagged in the
+reviewer audit; they are not assigned an arbitrary directional order. The
+primary definition requires *all* detections at the final timestamp to be gate
+detections before classifying a final-gate assumed exit.
+
+```{r live-histories}
+live_all <- det %>% filter(is.na(predation_dt) | dt < predation_dt)
+# All fish in the predation-analysis detected population remain in exit analysis.
+# No marine-table or primary-grid station filter is used here.
+live <- live_all
+# Fish with finalized predation but no corresponding raw detection remain flagged.
+predation_record_check <- pred %>% left_join(
+  det %>% distinct(fish, dt) %>% mutate(event_record_present=TRUE),
+  by=c("fish", "predation_dt"="dt")) %>%
+  mutate(event_record_present=replace_na(event_record_present, FALSE))
+export_csv(predation_record_check, "predation_record_check.csv")
+if (any(!predation_record_check$event_record_present))
+  warning("Some finalized events have no matching detection; inspect predation_record_check.csv.")
+
+fish_history <- bind_rows(lapply(detected_fish,function(id) {
+  x <- live_all %>% filter(fish==id)
+  last_dt <- last_time(x$dt)
+  first_out <- first_time(x$dt[x$outside_bay %in% TRUE])
+  preceding_gate <- if(!is.na(first_out))
+    last_time(x$dt[x$exit_gate & x$dt<first_out]) else na_time
+  final_rows <- if(nrow(x)) x %>% filter(dt==last_dt) else x
+  tibble(fish=id,first_detection_dt=first_time(x$dt),last_live_dt=last_dt,
+    final_timestamp_all_gate=nrow(final_rows)>0 && all(final_rows$exit_gate),
+    final_timestamp_any_gate=any(final_rows$exit_gate),
+    final_timestamp_n_stations=n_distinct(final_rows$station,na.rm=TRUE),
+    first_out_dt=first_out,gate_before_out_dt=preceding_gate,
+    n_live_records=nrow(x),n_days_detected=n_distinct(as.Date(x$dt)))
+})) %>% left_join(meta,by="fish") %>% left_join(pred,by="fish") %>%
+  mutate(confirmed=!is.na(first_out_dt),
+    confirmed_time_fallback=confirmed & is.na(gate_before_out_dt),
+    confirmed_exit_dt=coalesce(gate_before_out_dt,first_out_dt),
+    final_gate_predated=final_timestamp_all_gate & !is.na(predation_dt),
+    ambiguous_candidate=final_gate_predated & !confirmed,
+    censor_dt=coalesce(predation_dt,last_live_dt))
+stopifnot(nrow(fish_history)==length(detected_fish),
+          setequal(fish_history$fish,detected_fish),!anyNA(fish_history$censor_dt))
+export_csv(fish_history %>% filter(n_live_records==0),"no_pre_predation_observation.csv")
+# Without a preceding gate record, use first outside detection as an upper-bound
+# exit timestamp, rather than silently dropping a confirmed exit.
+export_csv(fish_history, "fish_detection_summary.csv")
+knitr::kable(fish_history %>% select(fish, cohort, confirmed,
+  confirmed_time_fallback, final_gate_predated, ambiguous_candidate))
+```
+
+# Reviewer audit of final-gate predated fish
+
+Counts are recalculated from current data. The broad group includes predated
+fish with any gate detection at their final live timestamp, including fish with
+an earlier confirmed exit. Only those with all final-timestamp records at gates
+and no confirmed exit change classification in the inclusive scenario.
+
+Full chronological sequences are exported for this broad group. The audit
+reports the total number of gate detection occasions (unique timestamp and
+station), the final uninterrupted run of gate occasions, time on that run, and
+the interval from last live observation to inferred predation. Multiple pings
+at one station do not establish a boundary crossing. No sequence is assigned a
+confirmed return unless an outside observation is followed by an inside,
+non-gate observation before inferred predation.
+
+```{r reviewer-audit}
+review_ids <- fish_history %>% filter(final_timestamp_any_gate, !is.na(predation_dt)) %>% pull(fish)
+review_sequences <- det %>% filter(fish %in% review_ids) %>%
+  mutate(phase=case_when(dt < predation_dt ~ "Pre-predation",
+                         dt == predation_dt ~ "First predation observation",
+                         TRUE ~ "Post-predation"),
+         hours_from_predation=as.numeric(difftime(dt, predation_dt, units="hours"))) %>%
+  arrange(fish, dt, station)
+export_csv(review_sequences, "reviewer_full_detection_sequences.csv")
+export_csv(review_sequences %>% filter(abs(hours_from_predation) <= audit_window_hours),
+           "reviewer_detection_sequences_near_predation.csv")
+
+review_audit <- bind_rows(lapply(review_ids, function(id) {
+  x <- live_all %>% filter(fish == id) %>% arrange(dt, station)
+  h <- fish_history %>% filter(fish == id)
+  occasions <- x %>% distinct(dt, station, exit_gate)
+  # Final gate run starts after the latest timestamp with a non-gate record.
+  last_nongate <- last_time(occasions$dt[!occasions$exit_gate])
+  terminal <- occasions %>% filter(exit_gate,
+    is.na(last_nongate) | dt > last_nongate)
+  event_rows <- det %>% filter(fish==id, dt==h$predation_dt)
+  returns <- x %>% filter(location_class=="Inside boundary", !is.na(h$first_out_dt),
+                           dt > h$first_out_dt)
+  tibble(fish=id, cohort=as.character(h$cohort), earlier_confirmed_exit=h$confirmed,
+    changes_in_inclusive=h$ambiguous_candidate,
+    n_gate_raw_records=sum(x$exit_gate),
+    n_gate_occasions=sum(occasions$exit_gate),
+    n_gate_stations=n_distinct(x$station[x$exit_gate]),
+    n_terminal_gate_occasions=nrow(terminal),
+    terminal_gate_hours=if(nrow(terminal)) as.numeric(difftime(max(terminal$dt),
+      min(terminal$dt), units="hours")) else NA_real_,
+    last_live_dt=h$last_live_dt, predation_dt=h$predation_dt,
+    hours_last_live_to_predation=as.numeric(difftime(h$predation_dt,h$last_live_dt,units="hours")),
+    predation_stations=paste(sort(unique(event_rows$station)), collapse="; "),
+    predation_location_classes=paste(sort(unique(event_rows$location_class)),collapse="; "),
+    observed_inside_after_outside=nrow(returns)>0,
+    simultaneous_final_stations=h$final_timestamp_n_stations)
+}))
+if (!length(review_ids)) review_audit <- tibble(fish=character(), changes_in_inclusive=logical())
+export_csv(review_audit, "reviewer_gate_predation_audit.csv")
+knitr::kable(review_audit, digits=2)
+review_counts <- tibble(
+  group=c("Any final-gate predated fish", "Additional inclusive exits"),
+  n=c(length(review_ids), sum(fish_history$ambiguous_candidate)),
+  denominator_predated_analyzed=sum(!is.na(fish_history$predation_dt)),
+  denominator_all_analyzed=nrow(fish_history)) %>%
+  mutate(percent_predated=if_else(denominator_predated_analyzed>0,
+    100*n/denominator_predated_analyzed, NA_real_),
+    percent_all_analyzed=100*n/denominator_all_analyzed)
+knitr::kable(review_counts, digits=1)
+export_csv(review_counts, "reviewer_counts_and_denominators.csv")
+```
+
+```{r reviewer-sequence-plot, fig.width=11, fig.height=7}
+if (nrow(review_sequences)) {
+  seq_plot <- review_sequences %>%
+    filter(abs(hours_from_predation) <= audit_window_hours) %>%
+    ggplot(aes(hours_from_predation, station, colour=location_class, shape=phase)) +
+    geom_point(size=2) + geom_vline(xintercept=0, linetype="dashed") +
+    facet_wrap(~fish, scales="free_y") + theme_bw() +
+    labs(x="Hours relative to first inferred predation observation", y="Receiver station",
+         colour="Location", shape="Detection phase")
+  print(seq_plot)
+  ggsave(out_path("reviewer_gate_sequences.png"),seq_plot,width=11,height=7,dpi=300)
+}
+```
+
+# First-exit classification and sensitivity analysis
+
+Predation is censored at the first inferred predation observation, matching the
+original script. Death occurred at an uncertain time between observations.
+Each fish appears once per scenario; earlier confirmed exits always take
+precedence. Assumed exits use the final live gate timestamp. Outside detections
+without a preceding gate use their first outside timestamp, explicitly flagged
+above as upper-bound exit times.
+
+```{r scenario-function}
+make_scenario <- function(history, scenario) {
+  allow_assumed <- scenario != "Confirmed only"
+  allow_predated <- scenario == "Inclusive"
+  history %>% mutate(scenario=scenario,
+    assumed=allow_assumed & !confirmed & final_timestamp_all_gate &
+      (is.na(predation_dt) | allow_predated),
+    exit_type=case_when(confirmed ~ "Confirmed", assumed ~ "Assumed",
+                        TRUE ~ "No observed exit"),
+    exit_dt=case_when(confirmed ~ confirmed_exit_dt, assumed ~ last_live_dt,
+                      TRUE ~ na_time),
+    event=as.integer(!is.na(exit_dt)), end_dt=coalesce(exit_dt,censor_dt),
+    time_days=as.numeric(difftime(end_dt,release_dt,units="days")),
+    changed_from_primary=scenario=="Inclusive" & ambiguous_candidate)
+}
+```
+
+The following small checks exercise the classification logic independently of
+study counts: a confirmed exit is preserved despite later predation; an ambiguous
+fish changes only in the inclusive scenario; ordinary final-gate exits are
+retained in the primary analysis; tied final gate/inside observations do not
+create an assumed exit.
+
+```{r classification-checks}
+check_time <- as.POSIXct("2024-04-01", tz="UTC")
+fixture <- tibble(fish=c("confirmed_predated","ambiguous","ordinary","tied"),
+  release_dt=check_time, confirmed=c(TRUE,FALSE,FALSE,FALSE),
+  confirmed_exit_dt=check_time+c(86400,NA,NA,NA),
+  last_live_dt=check_time+2*86400,
+  predation_dt=check_time+c(3*86400,3*86400,NA,3*86400),
+  final_timestamp_all_gate=c(TRUE,TRUE,TRUE,FALSE),
+  ambiguous_candidate=c(FALSE,TRUE,FALSE,FALSE),
+  censor_dt=check_time+c(3*86400,3*86400,2*86400,3*86400))
+check_primary <- make_scenario(fixture,"Primary")
+check_inclusive <- make_scenario(fixture,"Inclusive")
+check_confirmed <- make_scenario(fixture,"Confirmed only")
+stopifnot(identical(check_primary$event,c(1L,0L,1L,0L)),
+          identical(check_inclusive$event,c(1L,1L,1L,0L)),
+          identical(check_confirmed$event,c(1L,0L,0L,0L)),
+          check_primary$time_days[1]==1)
+```
+
+```{r scenario-data}
+scenario_data <- bind_rows(lapply(scenario_levels, function(s)
+  make_scenario(fish_history,s))) %>%
+  mutate(scenario=factor(scenario,levels=scenario_levels))
+stopifnot(!anyNA(scenario_data$time_days), all(is.finite(scenario_data$time_days)),
+  all(scenario_data$time_days>=0),
+  !anyDuplicated(scenario_data[c("fish","scenario")]),
+  all(is.na(scenario_data$predation_dt) | scenario_data$event==0L |
+        scenario_data$exit_dt < scenario_data$predation_dt))
+export_csv(scenario_data,"exit_individual_scenarios.csv")
+ci_binomial <- function(k,n) if(n>0) unname(binom.test(k,n)$conf.int) else c(NA_real_,NA_real_)
+summarize_exits <- function(x) {
+  k <- sum(x$event); n <- nrow(x); ci <- ci_binomial(k,n)
+  tibble(n_analyzed=n,n_exits=k,n_confirmed=sum(x$exit_type=="Confirmed"),
+    n_assumed=sum(x$exit_type=="Assumed"),n_censored=sum(x$event==0),
+    exit_proportion=k/n,ci_lower=ci[1],ci_upper=ci[2])
+}
+exit_summary <- bind_rows(
+  scenario_data %>% group_by(scenario,cohort) %>% group_modify(~summarize_exits(.x)) %>% ungroup() %>%
+    mutate(cohort=as.character(cohort)),
+  scenario_data %>% group_by(scenario) %>% group_modify(~summarize_exits(.x)) %>% ungroup() %>%
+    mutate(cohort="Combined"))
+knitr::kable(exit_summary,digits=3)
+export_csv(exit_summary,"exit_proportions_by_scenario.csv")
+# A direct audit of changes prevents double-counting earlier confirmed exits.
+change_table <- scenario_data %>% select(fish,cohort,scenario,exit_type,event,exit_dt) %>%
+  pivot_wider(names_from=scenario,values_from=c(exit_type,event,exit_dt))
+export_csv(change_table,"individual_classification_comparison.csv")
+```
+
+# Kaplan–Meier estimates and cohort tests
+
+Raw exit proportions above and KM curves answer different questions. Exact
+binomial intervals describe observed exit counts among analyzed fish; KM curves
+also account for follow-up duration under their censoring assumptions. No fish
+is described as continuously resident solely because no exit was observed.
+
+```{r km-and-logrank, fig.width=12, fig.height=6, out.width="100%"}
+km_fits <- list()
+logrank_results <- list()
+km_rows <- list()
+for (s in scenario_levels) {
+  x <- scenario_data %>% filter(scenario==s) %>% droplevels()
+  fit <- survival::survfit(Surv(time_days,event) ~ cohort, data=x)
+  km_fits[[s]] <- fit
+  km_rows[[s]] <- survminer::surv_summary(fit,data=x) %>% mutate(scenario=s)
+  # No test is reported if there are no exits or fewer than two represented cohorts.
+  if (sum(x$event)>0 && n_distinct(x$cohort)==2) {
+    test <- tryCatch(survival::survdiff(Surv(time_days,event) ~ cohort,data=x),
+                     error=function(e) e)
+    if (!inherits(test,"error") && is.finite(test$chisq)) {
+      test_df <- length(test$n)-1L
+      logrank_results[[s]] <- tibble(scenario=s,chisq=unname(test$chisq),df=test_df,
+        p_value=pchisq(test$chisq,df=test_df,lower.tail=FALSE),status="Estimated")
+    } else logrank_results[[s]] <- tibble(scenario=s,chisq=NA_real_,df=NA_integer_,
+      p_value=NA_real_,status="Not estimable")
+  } else logrank_results[[s]] <- tibble(scenario=s,chisq=NA_real_,df=NA_integer_,
+    p_value=NA_real_,status="Insufficient events or cohorts")
+  # Export the full plot with risk table for each classification scenario.
+  p <- survminer::ggsurvplot(fit,data=x,conf.int=TRUE,risk.table=TRUE,
+    censor=TRUE,pval=FALSE,palette=unname(plot_colours[levels(x$cohort)]),
+    legend.title="Release cohort",legend.labs=levels(x$cohort),
+    xlab="Days since release",ylab="Probability of no observed exit",
+    title=s,break.time.by=50,ggtheme=theme_bw(base_size=12))
+  if (s == "Primary") {
+    p$plot <- p$plot + theme(legend.position="top")
+    p$table <- p$table + theme(axis.title.x=element_blank())
+  }
+  print(p, surv.plot.height=0.78, risk.table.height=0.22)
+  slug <- gsub(" ","_",tolower(s))
+  combined <- survminer::arrange_ggsurvplots(
+    list(p), ncol=1, nrow=1, print=FALSE,
+    surv.plot.height=0.78, risk.table.height=0.22
+  )
+  # Primary manuscript figure uses a wide landscape layout, including risk table.
+  figure_width <- if (s == "Primary") 12 else 10
+  figure_height <- if (s == "Primary") 6 else 8
+  ggsave(out_path(paste0("km_exit_",slug,".png")),combined,
+         width=figure_width,height=figure_height,units="in",dpi=300,bg="white")
+}
+logrank_table <- bind_rows(logrank_results)
+knitr::kable(logrank_table,digits=4)
+export_csv(logrank_table,"logrank_tests_by_scenario.csv")
+km_data <- bind_rows(km_rows)
+export_csv(km_data,"km_estimates_by_scenario.csv")
+saveRDS(km_fits,out_path("km_exit_fits.rds"))
+```
+
+```{r sensitivity-overlay, fig.width=10, fig.height=6}
+# Include time zero so step curves start at one.
+curve_data <- bind_rows(
+  km_data %>% transmute(scenario,cohort=as.character(cohort),time,surv),
+  scenario_data %>% distinct(scenario,cohort) %>%
+    transmute(scenario=as.character(scenario),cohort=as.character(cohort),time=0,surv=1)) %>%
+  mutate(scenario=factor(scenario,levels=scenario_levels)) %>% arrange(scenario,cohort,time)
+overlay <- ggplot(curve_data,aes(time,surv,colour=cohort,linetype=scenario,
+                               group=interaction(cohort,scenario))) +
+  geom_step(linewidth=0.8) + scale_colour_manual(values=plot_colours) +
+  coord_cartesian(ylim=c(0,1)) + theme_bw(base_size=12) +
+  labs(x="Days since release",y="KM probability of no first observed exit",
+       colour="Release cohort",linetype="Classification")
+overlay
+ggsave(out_path("km_sensitivity_overlay.png"),overlay,width=10,height=6,dpi=300)
+# Quantify differences on a common within-cohort follow-up grid.
+km_at <- function(fit,times,cohort) {
+  z <- summary(fit,times=times,extend=TRUE)
+  tibble(time=z$time,stratum=as.character(z$strata),survival=z$surv) %>%
+    filter(stratum==paste0("cohort=",cohort)) %>% pull(survival)
+}
+curve_difference <- bind_rows(lapply(levels(droplevels(scenario_data$cohort)),function(cc) {
+  horizon <- scenario_data %>% filter(cohort==cc) %>% group_by(scenario) %>%
+    summarise(end=max(time_days),.groups="drop") %>% summarise(end=min(end)) %>% pull(end)
+  times <- sort(unique(c(0,scenario_data$time_days[scenario_data$cohort==cc &
+                                                  scenario_data$time_days<=horizon])))
+  a <- km_at(km_fits[["Primary"]],times,cc)
+  b <- km_at(km_fits[["Inclusive"]],times,cc)
+  tibble(cohort=cc,comparison_horizon_days=horizon,
+         max_absolute_KM_difference=max(abs(a-b)),
+         primary_KM_at_horizon=tail(a,1),inclusive_KM_at_horizon=tail(b,1))
+}))
+knitr::kable(curve_difference,digits=3)
+export_csv(curve_difference,"km_primary_inclusive_difference.csv")
+```
+
+# Calendar timing of first observed exits
+
+This panel shows individual exit dates under the primary classification, rather
+than a calendar-time survival curve. Release dates are marked separately for
+each cohort. Small vertical offsets separate individual fish; they have no
+biological meaning. Event counts are not adjusted for the number of fish under
+observation. Dates use UTC, consistent with the analysis timestamps.
+
+```{r calendar-exit-panel, fig.width=12, fig.height=3.5, out.width="100%", fig.cap="Calendar timing of first observed Bay of Fundy exits under the primary classification. Symbols distinguish confirmed and assumed exits; numbers identify individual fish. Diamonds mark cohort release dates. Vertical offsets separate observations and have no biological meaning. Event dates represent assigned exit times and are not estimates of seasonal exit probability."}
+primary_calendar <- scenario_data %>%
+  filter(as.character(scenario) == "Primary")
+
+calendar_exits <- primary_calendar %>%
+  filter(event == 1L, !is.na(exit_dt)) %>%
+  mutate(
+    exit_date = as.Date(exit_dt, tz = "UTC"),
+    cohort = factor(cohort, levels = c("December", "April")),
+    exit_type = factor(exit_type, levels = c("Confirmed", "Assumed"))
+  ) %>%
+  arrange(cohort, exit_dt, fish) %>%
+  group_by(cohort) %>%
+  mutate(
+    # Spread points without changing their actual calendar dates.
+    vertical_offset = if (n() == 1L) 0 else seq(-0.16, 0.16, length.out = n()),
+    row_position = as.numeric(cohort) + vertical_offset
+  ) %>%
+  ungroup()
+
+calendar_releases <- primary_calendar %>%
+  transmute(
+    cohort = factor(cohort, levels = c("December", "April")),
+    release_date = as.Date(release_dt, tz = "UTC"),
+    row_position = as.numeric(cohort)
+  ) %>%
+  distinct()
+
+calendar_exit_plot <- ggplot() +
+  geom_point(
+    data = calendar_releases,
+    aes(release_date, row_position),
+    shape = 23, fill = "white", colour = "black", size = 3.5, stroke = 1
+  ) +
+  geom_text(
+    data = calendar_releases,
+    aes(release_date, row_position, label = "Release"),
+    nudge_y = 0.30, size = 3.3
+  ) +
+  geom_point(
+    data = calendar_exits,
+    aes(exit_date, row_position, shape = exit_type, colour = cohort),
+    size = 3, stroke = 1
+  ) +
+  geom_text(
+    data = calendar_exits,
+    aes(exit_date, row_position, label = fish, colour = cohort),
+    nudge_y = 0.08, size = 3, show.legend = FALSE
+  ) +
+  scale_shape_manual(
+    name = "Exit classification",
+    values = c(Confirmed = 16, Assumed = 2), drop = FALSE
+  ) +
+  scale_colour_manual(values = plot_colours, guide = "none") +
+  scale_y_continuous(
+    breaks = c(1, 2), labels = c("December release", "April release"),
+    limits = c(0.65, 2.5)
+  ) +
+  scale_x_date(
+    date_breaks = "2 months", date_labels = "%b\n%Y",
+    expand = expansion(mult = c(0.05, 0.06))
+  ) +
+  labs(x = "Calendar date", y = NULL) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position = "top",
+    axis.ticks.y = element_blank()
+  )
+
+calendar_exit_plot
+export_csv(calendar_exits, "primary_exit_calendar_dates.csv")
+ggsave(out_path("primary_exit_calendar_panel.png"), calendar_exit_plot,
+       width = 12, height = 3.5, units = "in", dpi = 300, bg = "white")
+ggsave(out_path("primary_exit_calendar_panel.pdf"), calendar_exit_plot,
+       width = 12, height = 3.5, units = "in", bg = "white")
+```
+
+# Reporting checklist and reproducibility
+
+Use `reviewer_counts_and_denominators.csv` to report the affected number with an
+explicit denominator. Use `reviewer_gate_predation_audit.csv` and the full
+sequences to discuss whether gate observations were single occasions or repeated
+observations, their timing, earlier confirmed departures, and observed returns.
+A repeated gate record alone cannot distinguish movement across the boundary
+from continued presence within receiver range or tidal transport.
+
+Report primary and inclusive exit counts and cohort percentages from
+`exit_proportions_by_scenario.csv`, cohort log-rank results from
+`logrank_tests_by_scenario.csv`, and the magnitude of curve changes from
+`km_primary_inclusive_difference.csv`. Do not add fish already classified as
+confirmed exits a second time. Do not copy historical sample sizes or claim
+robustness before inspecting the generated results. Inspect boundary flags and
+any missing gate-before-outside timestamps before finalizing the manuscript.
+
+Differences from the original exploratory script include finalized predation
+events, validated metadata joins, exclusion of the predation observation from
+live histories, explicit treatment of simultaneous records, the same all-receiver detected-fish
+population as the predation analysis, no double-counting of confirmed exits, and preservation
+of actual release dates. Movement figures are produced separately by `migration_paths.Rmd`. Changes in counts can therefore reflect
+corrected preprocessing as well as the exit-classification sensitivity analysis.
+
+```{r reproducibility}
+settings_used <- list(receiver_file=receiver_file,gate_file=gate_file,
+  gate_station_ids=gate_station_ids,outside_station_file=outside_station_file,
+  outside_rule="Original west-of-westernmost-gate AND south-of-fitted-line heuristic; optional station overrides",
+  excluded_stations=excluded_stations,audit_window_hours=audit_window_hours,
+  predation_censor_time="First finalized inferred predation observation",
+  analysis_population="All detected fish retained by the predation analysis before predation truncation")
+saveRDS(settings_used,out_path("analysis_settings.rds"))
+input_files <- c("det_clean_no_release_site_det.rds","predation_events_clean.rds",
+                 "meta_clean.rds",receiver_file,gate_file,outside_station_file)
+input_files <- unique(input_files[file.exists(data_path(input_files))])
+export_csv(tibble(file=input_files,md5=unname(tools::md5sum(data_path(input_files)))),
+           "input_checksums.csv")
+capture.output(sessionInfo(),file=out_path("exit_session_info.txt"))
+```
